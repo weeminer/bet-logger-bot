@@ -99,22 +99,22 @@ def append_bet_to_sheet(bet_data: dict):
 
 
 # ============================================================================
-# CLAUDE VISION - BET SLIP EXTRACTION
+# CLAUDE VISION - BET SLIP EXTRACTION (MULTI-SLIP SUPPORT)
 # ============================================================================
-def extract_bet_data_from_image(image_bytes: bytes) -> dict:
+def extract_bet_data_from_image(image_bytes: bytes) -> list:
     """
     Send the bet slip image to Claude's Vision API and extract structured data.
-    Returns a dictionary with extracted bet information.
+    Returns a LIST of dictionaries, one for each bet slip found in the image.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # Convert image to base64
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    # Prompt for structured extraction
-    extraction_prompt = """Analyze this sports betting slip image and extract the following information.
+    # Prompt for structured extraction - MULTIPLE SLIPS
+    extraction_prompt = """Analyze this image and extract information from ALL bet slips visible.
 
-Return your response as a JSON object with these exact fields:
+Return a JSON ARRAY of objects, one for each bet slip found. Each object should have these fields:
 {
     "bet_date": "YYYY-MM-DD format, the date on the bet slip",
     "sport": "the sport or league (NFL, NBA, MLB, NHL, UFC, Soccer, etc.)",
@@ -125,21 +125,23 @@ Return your response as a JSON object with these exact fields:
     "win_loss_amount": "numeric value only, positive if won, negative if lost, 0 if pending",
     "is_winner": "true/false/pending",
     "confidence": "high/medium/low - how confident you are in the extraction",
-    "raw_text": "brief summary of what you can read on the slip",
+    "raw_text": "brief summary of what you can read on this slip",
     "notes": "any issues or unclear parts"
 }
 
-Important:
+IMPORTANT:
+- Return a JSON ARRAY even if there's only one slip: [{ ... }]
+- Extract EVERY separate bet slip visible in the image
 - If you cannot clearly read a value, set confidence to "low" and explain in notes
 - For win_loss_amount: use the payout amount minus wager if won, negative wager if lost
 - If the bet is still pending/open, set is_winner to "pending" and win_loss_amount to 0
 - Extract the actual date from the slip, not today's date
 - For parlays, list all legs in teams_event separated by " / "
-- Return ONLY the JSON object, no other text"""
+- Return ONLY the JSON array, no other text"""
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=500,
+        max_tokens=2000,  # Increased for multiple slips
         messages=[
             {
                 "role": "user",
@@ -175,9 +177,14 @@ Important:
             json_str = response_text
 
         extracted_data = json.loads(json_str.strip())
+
+        # Ensure it's a list
+        if isinstance(extracted_data, dict):
+            extracted_data = [extracted_data]
+
     except json.JSONDecodeError:
-        # If parsing fails, return a needs-review entry
-        extracted_data = {
+        # If parsing fails, return a needs-review entry as a list
+        extracted_data = [{
             "bet_date": "",
             "wager_amount": "",
             "win_loss_amount": "",
@@ -185,7 +192,7 @@ Important:
             "confidence": "low",
             "raw_text": response_text[:200],
             "notes": "Failed to parse - manual review needed"
-        }
+        }]
 
     return extracted_data
 
@@ -251,7 +258,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming photos (bet slips)."""
+    """Handle incoming photos (bet slips) - supports multiple slips per image."""
     user = update.effective_user
     username = user.username or str(user.id)
 
@@ -259,7 +266,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
 
     # Send "processing" message
-    processing_msg = await update.message.reply_text("📊 Processing bet slip...")
+    processing_msg = await update.message.reply_text("📊 Processing bet slip(s)...")
 
     try:
         # Download the photo (get the highest resolution version)
@@ -271,74 +278,78 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await photo_file.download_to_memory(photo_bytes)
         photo_bytes.seek(0)
 
-        # Extract data using OpenAI Vision
-        extracted_data = extract_bet_data_from_image(photo_bytes.read())
+        # Extract data using Claude Vision - returns a LIST of bets
+        extracted_bets = extract_bet_data_from_image(photo_bytes.read())
 
-        # Determine status based on confidence
-        if extracted_data.get("confidence") == "low":
-            status = "NEEDS REVIEW"
-        elif extracted_data.get("is_winner") == "pending":
-            status = "PENDING"
-        else:
-            status = "LOGGED"
+        logged_count = 0
+        review_count = 0
+        results_summary = []
 
-        # Calculate net result
-        try:
-            wager = float(extracted_data.get("wager_amount", 0) or 0)
-            win_loss = float(extracted_data.get("win_loss_amount", 0) or 0)
-            net_result = win_loss
-        except (ValueError, TypeError):
-            wager = extracted_data.get("wager_amount", "")
-            win_loss = extracted_data.get("win_loss_amount", "")
-            net_result = ""
+        for extracted_data in extracted_bets:
+            # Determine status based on confidence
+            if extracted_data.get("confidence") == "low":
+                status = "NEEDS REVIEW"
+                review_count += 1
+            elif extracted_data.get("is_winner") == "pending":
+                status = "PENDING"
+                logged_count += 1
+            else:
+                status = "LOGGED"
+                logged_count += 1
 
-        # Prepare the row data
-        bet_data = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "bettor_name": bettor_name,
-            "bet_date": extracted_data.get("bet_date", ""),
-            "sport": extracted_data.get("sport", ""),
-            "bet_type": extracted_data.get("bet_type", ""),
-            "teams_event": extracted_data.get("teams_event", ""),
-            "odds": extracted_data.get("odds", ""),
-            "wager_amount": wager,
-            "win_loss_amount": win_loss,
-            "net_result": net_result,
-            "status": status,
-            "raw_text": extracted_data.get("raw_text", "")[:500],
-            "notes": extracted_data.get("notes", ""),
-        }
+            # Calculate net result
+            try:
+                wager = float(extracted_data.get("wager_amount", 0) or 0)
+                win_loss = float(extracted_data.get("win_loss_amount", 0) or 0)
+                net_result = win_loss
+            except (ValueError, TypeError):
+                wager = extracted_data.get("wager_amount", "")
+                win_loss = extracted_data.get("win_loss_amount", "")
+                net_result = ""
 
-        # Append to Google Sheet
-        append_bet_to_sheet(bet_data)
+            # Prepare the row data
+            bet_data = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "bettor_name": bettor_name,
+                "bet_date": extracted_data.get("bet_date", ""),
+                "sport": extracted_data.get("sport", ""),
+                "bet_type": extracted_data.get("bet_type", ""),
+                "teams_event": extracted_data.get("teams_event", ""),
+                "odds": extracted_data.get("odds", ""),
+                "wager_amount": wager,
+                "win_loss_amount": win_loss,
+                "net_result": net_result,
+                "status": status,
+                "raw_text": extracted_data.get("raw_text", "")[:500],
+                "notes": extracted_data.get("notes", ""),
+            }
+
+            # Append to Google Sheet
+            append_bet_to_sheet(bet_data)
+
+            # Add to summary
+            wager_str = f"${wager}" if wager else "?"
+            event_str = extracted_data.get("teams_event", "Unknown")[:30]
+            results_summary.append(f"• {event_str} ({wager_str})")
 
         # Send confirmation
-        if status == "NEEDS REVIEW":
+        total_bets = len(extracted_bets)
+        summary_text = "\n".join(results_summary[:10])  # Show first 10
+        if len(results_summary) > 10:
+            summary_text += f"\n... and {len(results_summary) - 10} more"
+
+        if review_count > 0:
             await processing_msg.edit_text(
-                f"⚠️ Bet logged but NEEDS REVIEW\n\n"
-                f"Bettor: {bettor_name}\n"
-                f"Date: {bet_data['bet_date'] or 'unclear'}\n"
-                f"Sport: {bet_data['sport'] or 'unclear'}\n"
-                f"Type: {bet_data['bet_type'] or 'unclear'}\n"
-                f"Event: {bet_data['teams_event'] or 'unclear'}\n"
-                f"Odds: {bet_data['odds'] or 'unclear'}\n"
-                f"Wager: ${wager if wager else 'unclear'}\n"
-                f"Result: ${win_loss if win_loss else 'unclear'}\n\n"
-                f"Note: {extracted_data.get('notes', 'Some values unclear')}"
+                f"📊 Processed {total_bets} bet slip(s)\n\n"
+                f"✅ Logged: {logged_count}\n"
+                f"⚠️ Needs Review: {review_count}\n\n"
+                f"Bets found:\n{summary_text}"
             )
         else:
-            result_emoji = "🎉" if (isinstance(win_loss, (int, float)) and win_loss > 0) else "📝"
             await processing_msg.edit_text(
-                f"{result_emoji} Bet logged successfully!\n\n"
-                f"Bettor: {bettor_name}\n"
-                f"Date: {bet_data['bet_date']}\n"
-                f"Sport: {bet_data['sport']}\n"
-                f"Type: {bet_data['bet_type']}\n"
-                f"Event: {bet_data['teams_event']}\n"
-                f"Odds: {bet_data['odds']}\n"
-                f"Wager: ${wager}\n"
-                f"Result: ${win_loss}\n"
-                f"Status: {status}"
+                f"🎉 Logged {total_bets} bet slip(s)!\n\n"
+                f"Bettor: {bettor_name}\n\n"
+                f"Bets found:\n{summary_text}"
             )
 
     except Exception as e:

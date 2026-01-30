@@ -78,13 +78,14 @@ def append_bet_to_sheet(bet_data: dict):
     """Append a single bet record to the Google Sheet."""
     worksheet = get_google_sheet()
 
-    # New column order:
-    # A: Timestamp, B: Trader, C: Bettor, D: Match Date, E: League,
-    # F: Teams/Event, G: Selection, H: Bet Type, I: Odds, J: Wager,
-    # K: Potential Payout, L: Result, M: Net Result, N: Commission,
-    # O: Status, P: Raw Text, Q: Notes
+    # Column order:
+    # A: Timestamp, B: Date Placed, C: Trader, D: Bettor, E: Match Date, F: League,
+    # G: Teams/Event, H: Selection, I: Bet Type, J: Odds, K: Wager,
+    # L: Potential Payout, M: Result, N: Net Result, O: Commission,
+    # P: Status, Q: Raw Text, R: Notes
     row = [
         bet_data.get("timestamp", ""),
+        bet_data.get("date_placed", ""),
         bet_data.get("trader", ""),
         bet_data.get("bettor_name", ""),
         bet_data.get("match_date", ""),
@@ -370,6 +371,7 @@ async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_
             # Prepare the row data
             bet_data = {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "date_placed": datetime.now().strftime("%Y-%m-%d"),  # Date bet was placed (defaults to today)
                 "trader": trader,
                 "bettor_name": bettor_name,
                 "match_date": extracted_data.get("match_date", ""),

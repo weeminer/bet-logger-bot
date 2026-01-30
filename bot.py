@@ -355,9 +355,15 @@ async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_
                 potential_payout = extracted_data.get("potential_payout", "")
                 net_result = ""
 
-            # Calculate commission (10% of profit if won)
+            # Calculate commission: if payout/wager >= 2, use 1% of wager; else 1% of profit
             try:
-                commission = net_result * 0.10 if isinstance(net_result, (int, float)) and net_result > 0 else 0
+                if isinstance(wager, (int, float)) and isinstance(potential_payout, (int, float)) and wager > 0 and result.lower() == "win":
+                    if potential_payout / wager >= 2:
+                        commission = wager * 0.01
+                    else:
+                        commission = (potential_payout - wager) * 0.01
+                else:
+                    commission = 0
             except:
                 commission = ""
 

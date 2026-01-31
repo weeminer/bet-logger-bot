@@ -2,19 +2,16 @@
 Bet Slip Telegram Bot
 =====================
 This bot receives bet slip images via Telegram DM, extracts the data using
-OpenAI's Vision API, and logs it to a Google Sheet.
+Claude's Vision API, and logs it to a Google Sheet.
 
-Setup required:
-1. Create a Telegram bot via @BotFather and get the token
-2. Get an OpenAI API key
-3. Set up Google Sheets API credentials (see setup guide)
-4. Configure the environment variables below
+Supports multiple photos at once - asks for trader only once for all photos.
 """
 
 import os
 import json
 import base64
 import logging
+import asyncio
 from datetime import datetime
 from io import BytesIO
 
@@ -39,6 +36,9 @@ BETTOR_NAMES = {
     "Erich": "Erich",
     "Zak": "Zak",
 }
+
+# How long to wait for more photos before asking for trader (seconds)
+PHOTO_BATCH_TIMEOUT = 3
 
 # Logging setup
 logging.basicConfig(
@@ -78,6 +78,13 @@ def append_bet_to_sheet(bet_data: dict):
     """Append a single bet record to the Google Sheet."""
     worksheet = get_google_sheet()
 
+    # Get the next row number (current rows + 1)
+    next_row = len(worksheet.get_all_values()) + 1
+
+    # Commission formula: if payout/wager >= 2, use 1% of wager; else 1% of profit
+    # Commission is owed on ALL bets (win, loss, or push) based on potential payout
+    commission_formula = f'=IF(L{next_row}/K{next_row}>=2,K{next_row}*0.01,(L{next_row}-K{next_row})*0.01)'
+
     # Column order:
     # A: Timestamp, B: Date Placed, C: Trader, D: Bettor, E: Match Date, F: League,
     # G: Teams/Event, H: Selection, I: Bet Type, J: Odds, K: Wager,
@@ -98,7 +105,7 @@ def append_bet_to_sheet(bet_data: dict):
         bet_data.get("potential_payout", ""),
         bet_data.get("result", ""),
         bet_data.get("net_result", ""),
-        bet_data.get("commission", ""),
+        commission_formula,  # Commission calculated by formula
         bet_data.get("status", ""),
         bet_data.get("raw_text", ""),
         bet_data.get("notes", ""),
@@ -126,7 +133,8 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
 
 Return a JSON ARRAY of objects, one for each bet slip found. Each object should have these fields:
 {
-    "match_date": "YYYY-MM-DD format, the date of the GAME/MATCH (not when bet was placed)",
+    "date_placed": "YYYY-MM-DD format, the date the BET WAS PLACED (usually shown near ticket/slip number, NOT the game date)",
+    "match_date": "YYYY-MM-DD format, the date of the GAME/MATCH being bet on",
     "league": "the league (NFL, NBA, MLB, NHL, UFC, MLS, Premier League, etc.)",
     "teams_event": "the teams or event (e.g., 'Lakers vs Celtics' or 'Chiefs vs Ravens')",
     "selection": "what we bet ON specifically (e.g., 'Lakers -3.5', 'Over 45.5', 'Chiefs ML', 'Patrick Mahomes 300+ yards')",
@@ -143,7 +151,8 @@ Return a JSON ARRAY of objects, one for each bet slip found. Each object should 
 IMPORTANT:
 - Return a JSON ARRAY even if there's only one slip: [{ ... }]
 - Extract EVERY separate bet slip visible in the image
-- match_date is the date of the GAME, not when the bet was placed
+- date_placed is the date the BET WAS PLACED - look for this near the ticket number, slip ID, or at the top of the slip
+- match_date is the date of the GAME being bet on
 - selection should be the specific pick (team + spread, over/under, moneyline, etc.)
 - potential_payout is the TOTAL you'd receive if you win (stake + profit)
 - result should be "Win", "Loss", "Push", or "Pending" based on what the slip shows
@@ -197,10 +206,11 @@ IMPORTANT:
     except json.JSONDecodeError:
         # If parsing fails, return a needs-review entry as a list
         extracted_data = [{
-            "bet_date": "",
+            "date_placed": "",
+            "match_date": "",
             "wager_amount": "",
-            "win_loss_amount": "",
-            "is_winner": "unknown",
+            "potential_payout": "",
+            "result": "Pending",
             "confidence": "low",
             "raw_text": response_text[:200],
             "notes": "Failed to parse - manual review needed"
@@ -219,6 +229,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi {user.first_name}! 👋\n\n"
         "I'm the Bet Slip Logger bot. Send me photos of your bet slips "
         "and I'll automatically log them to the spreadsheet.\n\n"
+        "💡 You can send multiple photos at once - I'll ask for the trader once for all of them.\n\n"
         "Commands:\n"
         "/start - Show this message\n"
         "/status - Check if I'm connected properly\n"
@@ -258,35 +269,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /help command."""
     await update.message.reply_text(
         "📸 How to send bet slips:\n\n"
-        "1. Take a clear photo of the bet slip\n"
-        "2. Make sure the amounts and date are visible\n"
-        "3. Send the photo directly to me\n"
-        "4. I'll confirm when it's logged\n\n"
+        "1. Take clear photos of your bet slips\n"
+        "2. Send ALL photos at once (or quickly one after another)\n"
+        "3. I'll ask who the trader is ONCE for all slips\n"
+        "4. I'll process them all and log to the spreadsheet\n\n"
         "Tips:\n"
         "• Good lighting helps accuracy\n"
         "• Avoid blurry photos\n"
-        "• Send one slip per photo for best results"
+        "• Multiple slips per photo is fine too!"
     )
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming photos (bet slips) - asks for trader first."""
-    user = update.effective_user
-    username = user.username or str(user.id)
+async def process_batch_after_timeout(context: ContextTypes.DEFAULT_TYPE):
+    """Process the batch of photos after the timeout."""
+    job = context.job
+    chat_id = job.chat_id
+    user_data = job.data
 
-    # Get bettor name from mapping, or use Telegram name
-    bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
+    # Get pending photos
+    pending_photos = user_data.get('pending_photos', [])
+    bettor_name = user_data.get('bettor_name', 'Unknown')
 
-    # Download the photo and store it temporarily
-    photo = update.message.photo[-1]
-    photo_file = await photo.get_file()
-    photo_bytes = BytesIO()
-    await photo_file.download_to_memory(photo_bytes)
-    photo_bytes.seek(0)
-
-    # Store photo data in context for later processing
-    context.user_data['pending_photo'] = photo_bytes.getvalue()
-    context.user_data['bettor_name'] = bettor_name
+    if not pending_photos:
+        return
 
     # Ask who the trader is
     keyboard = [
@@ -297,138 +302,180 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        "📸 Got the slip! Who was the trader today?",
+    photo_count = len(pending_photos)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📸 Got {photo_count} photo{'s' if photo_count > 1 else ''}! Who was the trader?",
         reply_markup=reply_markup
     )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos (bet slips) - collects multiple before asking for trader."""
+    user = update.effective_user
+    username = user.username or str(user.id)
+    chat_id = update.effective_chat.id
+
+    # Get bettor name from mapping, or use Telegram name
+    bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
+
+    # Download the photo
+    photo = update.message.photo[-1]
+    photo_file = await photo.get_file()
+    photo_bytes = BytesIO()
+    await photo_file.download_to_memory(photo_bytes)
+    photo_bytes.seek(0)
+
+    # Initialize pending_photos list if not exists
+    if 'pending_photos' not in context.user_data:
+        context.user_data['pending_photos'] = []
+
+    # Add this photo to the pending list
+    context.user_data['pending_photos'].append(photo_bytes.getvalue())
+    context.user_data['bettor_name'] = bettor_name
+
+    # Cancel any existing timeout job for this user
+    current_jobs = context.job_queue.get_jobs_by_name(f"batch_{chat_id}")
+    for job in current_jobs:
+        job.schedule_removal()
+
+    # Schedule a new timeout job - will trigger after PHOTO_BATCH_TIMEOUT seconds of no new photos
+    context.job_queue.run_once(
+        process_batch_after_timeout,
+        PHOTO_BATCH_TIMEOUT,
+        chat_id=chat_id,
+        name=f"batch_{chat_id}",
+        data=context.user_data
+    )
+
+    # Quick acknowledgment
+    photo_count = len(context.user_data['pending_photos'])
+    if photo_count == 1:
+        await update.message.reply_text("📸 Got it! Send more photos or wait a moment...")
+    else:
+        await update.message.reply_text(f"📸 +1 ({photo_count} total)")
+
+
 async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle trader selection and process the bet slip."""
+    """Handle trader selection and process ALL pending bet slips."""
     query = update.callback_query
     await query.answer()
 
     # Get trader from callback data
     trader = query.data.replace("trader_", "")
     bettor_name = context.user_data.get('bettor_name', 'Unknown')
-    photo_bytes = context.user_data.get('pending_photo')
+    pending_photos = context.user_data.get('pending_photos', [])
 
-    if not photo_bytes:
-        await query.edit_message_text("❌ No photo found. Please send the bet slip again.")
+    if not pending_photos:
+        await query.edit_message_text("❌ No photos found. Please send the bet slips again.")
         return
 
+    photo_count = len(pending_photos)
     # Update message to show processing
-    await query.edit_message_text(f"📊 Processing bet slip(s)...\nTrader: {trader}")
+    await query.edit_message_text(f"📊 Processing {photo_count} photo{'s' if photo_count > 1 else ''}...\nTrader: {trader}")
 
     try:
-        # Extract data using Claude Vision - returns a LIST of bets
-        extracted_bets = extract_bet_data_from_image(photo_bytes)
+        total_logged = 0
+        total_review = 0
+        total_wagered = 0
+        all_results = []
 
-        logged_count = 0
-        review_count = 0
-        results_summary = []
+        # Process each photo
+        for i, photo_bytes in enumerate(pending_photos):
+            # Extract data using Claude Vision - returns a LIST of bets per photo
+            extracted_bets = extract_bet_data_from_image(photo_bytes)
 
-        for extracted_data in extracted_bets:
-            # Determine status based on confidence
-            if extracted_data.get("confidence") == "low":
-                status = "NEEDS REVIEW"
-                review_count += 1
-            else:
-                status = "LOGGED"
-                logged_count += 1
-
-            # Calculate net result based on result
-            result = extracted_data.get("result", "Pending")
-            try:
-                wager = float(extracted_data.get("wager_amount", 0) or 0)
-                potential_payout = float(extracted_data.get("potential_payout", 0) or 0)
-
-                if result.lower() == "win":
-                    net_result = potential_payout - wager  # Profit
-                elif result.lower() == "loss":
-                    net_result = -wager  # Lost the wager
-                elif result.lower() == "push":
-                    net_result = 0  # Money back
+            for extracted_data in extracted_bets:
+                # Determine status based on confidence
+                if extracted_data.get("confidence") == "low":
+                    status = "NEEDS REVIEW"
+                    total_review += 1
                 else:
-                    net_result = 0  # Pending
-            except (ValueError, TypeError):
-                wager = extracted_data.get("wager_amount", "")
-                potential_payout = extracted_data.get("potential_payout", "")
-                net_result = ""
+                    status = "LOGGED"
+                    total_logged += 1
 
-            # Calculate commission: if payout/wager >= 2, use 1% of wager; else 1% of profit
-            try:
-                if isinstance(wager, (int, float)) and isinstance(potential_payout, (int, float)) and wager > 0 and result.lower() == "win":
-                    if potential_payout / wager >= 2:
-                        commission = wager * 0.01
+                # Calculate net result based on result
+                result = extracted_data.get("result", "Pending")
+                try:
+                    wager = float(extracted_data.get("wager_amount", 0) or 0)
+                    potential_payout = float(extracted_data.get("potential_payout", 0) or 0)
+                    total_wagered += wager  # Track total wagered
+
+                    if result.lower() == "win":
+                        net_result = potential_payout - wager  # Profit
+                    elif result.lower() == "loss":
+                        net_result = -wager  # Lost the wager
+                    elif result.lower() == "push":
+                        net_result = 0  # Money back
                     else:
-                        commission = (potential_payout - wager) * 0.01
-                else:
-                    commission = 0
-            except:
-                commission = ""
+                        net_result = 0  # Pending
+                except (ValueError, TypeError):
+                    wager = extracted_data.get("wager_amount", "")
+                    potential_payout = extracted_data.get("potential_payout", "")
+                    net_result = ""
 
-            # Prepare the row data
-            bet_data = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "date_placed": datetime.now().strftime("%Y-%m-%d"),  # Date bet was placed (defaults to today)
-                "trader": trader,
-                "bettor_name": bettor_name,
-                "match_date": extracted_data.get("match_date", ""),
-                "league": extracted_data.get("league", ""),
-                "teams_event": extracted_data.get("teams_event", ""),
-                "selection": extracted_data.get("selection", ""),
-                "bet_type": extracted_data.get("bet_type", ""),
-                "odds": extracted_data.get("odds", ""),
-                "wager_amount": wager,
-                "potential_payout": potential_payout,
-                "result": result,
-                "net_result": net_result,
-                "commission": commission,
-                "status": status,
-                "raw_text": extracted_data.get("raw_text", "")[:500],
-                "notes": extracted_data.get("notes", ""),
-            }
+                # Prepare the row data
+                bet_data = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "date_placed": extracted_data.get("date_placed", ""),  # From the slip itself
+                    "trader": trader,
+                    "bettor_name": bettor_name,
+                    "match_date": extracted_data.get("match_date", ""),
+                    "league": extracted_data.get("league", ""),
+                    "teams_event": extracted_data.get("teams_event", ""),
+                    "selection": extracted_data.get("selection", ""),
+                    "bet_type": extracted_data.get("bet_type", ""),
+                    "odds": extracted_data.get("odds", ""),
+                    "wager_amount": wager,
+                    "potential_payout": potential_payout,
+                    "result": result,
+                    "net_result": net_result,
+                    "status": status,
+                    "raw_text": extracted_data.get("raw_text", "")[:500],
+                    "notes": extracted_data.get("notes", ""),
+                }
 
-            # Append to Google Sheet
-            append_bet_to_sheet(bet_data)
+                # Append to Google Sheet
+                append_bet_to_sheet(bet_data)
 
-            # Add to summary
-            wager_str = f"${wager}" if wager else "?"
-            selection_str = extracted_data.get("selection", "Unknown")[:35]
-            results_summary.append(f"• {selection_str} ({wager_str})")
+                # Add to summary
+                wager_str = f"${wager}" if wager else "?"
+                selection_str = extracted_data.get("selection", "Unknown")[:30]
+                all_results.append(f"• {selection_str} ({wager_str})")
 
-        # Clear stored photo
-        context.user_data.pop('pending_photo', None)
+        # Clear stored photos
+        context.user_data.pop('pending_photos', None)
         context.user_data.pop('bettor_name', None)
 
         # Send confirmation
-        total_bets = len(extracted_bets)
-        summary_text = "\n".join(results_summary[:10])
-        if len(results_summary) > 10:
-            summary_text += f"\n... and {len(results_summary) - 10} more"
+        total_bets = total_logged + total_review
+        summary_text = "\n".join(all_results[:15])
+        if len(all_results) > 15:
+            summary_text += f"\n... and {len(all_results) - 15} more"
 
-        if review_count > 0:
+        if total_review > 0:
             await query.edit_message_text(
-                f"📊 Processed {total_bets} bet slip(s)\n\n"
+                f"📊 Processed {photo_count} photo{'s' if photo_count > 1 else ''} → {total_bets} bet{'s' if total_bets > 1 else ''}\n\n"
                 f"Trader: {trader}\n"
-                f"Bettor: {bettor_name}\n\n"
-                f"✅ Logged: {logged_count}\n"
-                f"⚠️ Needs Review: {review_count}\n\n"
+                f"Bettor: {bettor_name}\n"
+                f"💰 Total Wagered: ${total_wagered:,.2f}\n\n"
+                f"✅ Logged: {total_logged}\n"
+                f"⚠️ Needs Review: {total_review}\n\n"
                 f"Bets:\n{summary_text}"
             )
         else:
             await query.edit_message_text(
-                f"🎉 Logged {total_bets} bet slip(s)!\n\n"
+                f"🎉 Logged {total_bets} bet{'s' if total_bets > 1 else ''} from {photo_count} photo{'s' if photo_count > 1 else ''}!\n\n"
                 f"Trader: {trader}\n"
-                f"Bettor: {bettor_name}\n\n"
+                f"Bettor: {bettor_name}\n"
+                f"💰 Total Wagered: ${total_wagered:,.2f}\n\n"
                 f"Bets:\n{summary_text}"
             )
 
     except Exception as e:
-        logger.error(f"Error processing bet slip: {e}")
+        logger.error(f"Error processing bet slips: {e}")
         await query.edit_message_text(
-            f"❌ Error processing bet slip\n\n"
+            f"❌ Error processing bet slips\n\n"
             f"Error: {str(e)[:100]}\n\n"
             f"Please try again."
         )
@@ -438,7 +485,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages (not photos)."""
     await update.message.reply_text(
         "Please send me a photo of the bet slip. 📸\n\n"
-        "I need an image to extract the bet information."
+        "I need an image to extract the bet information.\n"
+        "You can send multiple photos at once!"
     )
 
 

@@ -11,7 +11,8 @@ import os
 import json
 import base64
 import logging
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
 from io import BytesIO
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "YOUR_GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")  # JSON string of service account
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "7716a34ed8aa5c65c5223ee84238d653")  # The Odds API key
 
 # Map Telegram usernames/names to bettor names
 BETTOR_NAMES = {
@@ -216,6 +218,231 @@ IMPORTANT:
 
 
 # ============================================================================
+# BET GRADING WITH THE ODDS API
+# ============================================================================
+
+# Map league names to Odds API sport keys
+LEAGUE_TO_SPORT_KEY = {
+    "NFL": "americanfootball_nfl",
+    "NBA": "basketball_nba",
+    "MLB": "baseball_mlb",
+    "NHL": "icehockey_nhl",
+    "NCAAB": "basketball_ncaab",
+    "NCAAF": "americanfootball_ncaaf",
+    "UFC": "mma_mixed_martial_arts",
+    "MMA": "mma_mixed_martial_arts",
+    "EPL": "soccer_epl",
+    "PREMIER LEAGUE": "soccer_epl",
+    "LA LIGA": "soccer_spain_la_liga",
+    "SERIE A": "soccer_italy_serie_a",
+    "BUNDESLIGA": "soccer_germany_bundesliga",
+    "MLS": "soccer_usa_mls",
+    "CHAMPIONS LEAGUE": "soccer_uefa_champs_league",
+}
+
+
+def get_pending_bets():
+    """Fetch all pending bets from the sheet."""
+    worksheet = get_google_sheet()
+    all_rows = worksheet.get_all_values()
+
+    pending_bets = []
+    # Skip header row, find rows where Result (column M, index 12) is "Pending"
+    for row_num, row in enumerate(all_rows[1:], start=2):  # start=2 because row 1 is header
+        if len(row) > 12 and row[12].lower() == "pending":
+            pending_bets.append({
+                "row_num": row_num,
+                "match_date": row[4] if len(row) > 4 else "",
+                "league": row[5] if len(row) > 5 else "",
+                "teams_event": row[6] if len(row) > 6 else "",
+                "selection": row[7] if len(row) > 7 else "",
+                "bet_type": row[8] if len(row) > 8 else "",
+                "odds": row[9] if len(row) > 9 else "",
+                "wager": row[10] if len(row) > 10 else "",
+                "potential_payout": row[11] if len(row) > 11 else "",
+            })
+
+    return pending_bets
+
+
+def fetch_scores_from_odds_api(sport_key: str, days_from: int = 3) -> list:
+    """Fetch completed game scores from The Odds API."""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "daysFrom": days_from,  # Look back this many days
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error fetching scores from Odds API: {e}")
+        return []
+
+
+def find_game_score(bet: dict, scores: list) -> dict:
+    """Find the matching game score for a bet."""
+    teams_event = bet['teams_event'].lower()
+
+    for game in scores:
+        if not game.get('completed'):
+            continue
+
+        home_team = game.get('home_team', '').lower()
+        away_team = game.get('away_team', '').lower()
+
+        # Check if both teams are mentioned in the bet
+        if (home_team in teams_event or any(word in teams_event for word in home_team.split())) and \
+           (away_team in teams_event or any(word in teams_event for word in away_team.split())):
+            # Found the game - extract scores
+            scores_list = game.get('scores', [])
+            if scores_list:
+                home_score = None
+                away_score = None
+                for score in scores_list:
+                    if score['name'].lower() == home_team:
+                        home_score = int(score['score'])
+                    elif score['name'].lower() == away_team:
+                        away_score = int(score['score'])
+
+                if home_score is not None and away_score is not None:
+                    return {
+                        "found": True,
+                        "home_team": game['home_team'],
+                        "away_team": game['away_team'],
+                        "home_score": home_score,
+                        "away_score": away_score,
+                        "completed": True
+                    }
+
+    return {"found": False}
+
+
+def grade_bet_with_score(bet: dict, game_score: dict) -> dict:
+    """Use Claude to grade a bet given the actual score."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    score_str = f"{game_score['away_team']} {game_score['away_score']} @ {game_score['home_team']} {game_score['home_score']}"
+
+    grading_prompt = f"""Grade this sports bet based on the ACTUAL FINAL SCORE provided.
+
+BET DETAILS:
+- Teams/Event: {bet['teams_event']}
+- Selection: {bet['selection']}
+- Bet Type: {bet['bet_type']}
+- Odds: {bet['odds']}
+
+ACTUAL FINAL SCORE:
+{score_str}
+(Home: {game_score['home_team']} {game_score['home_score']}, Away: {game_score['away_team']} {game_score['away_score']})
+
+GRADING RULES:
+- SPREAD BETS: "Team -3.5" means that team must win by MORE than 3.5 points. "Team +3.5" means that team can lose by up to 3 points and still win the bet.
+- MONEYLINE: Just check which team won
+- OVER/UNDER: Add both scores together and compare to the line
+- If the margin exactly equals a whole number spread (no .5), it's a PUSH
+
+Return ONLY a JSON object:
+{{
+    "result": "Win" or "Loss" or "Push",
+    "reasoning": "brief explanation (e.g., 'Lakers won by 7, covering -3.5 spread')"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": grading_prompt}]
+        )
+
+        response_text = response.content[0].text
+
+        # Parse JSON
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0]
+        else:
+            json_str = response_text
+
+        result = json.loads(json_str.strip())
+        result['final_score'] = score_str
+        result['confidence'] = 'high'  # High confidence since we have real scores
+        return result
+
+    except Exception as e:
+        logger.error(f"Error grading bet with Claude: {e}")
+        return {
+            "result": "Pending",
+            "confidence": "low",
+            "final_score": score_str,
+            "reasoning": f"Error grading: {str(e)[:50]}"
+        }
+
+
+def grade_bet(bet: dict) -> dict:
+    """Main function to grade a single bet using The Odds API."""
+    league = bet['league'].upper().strip()
+    sport_key = LEAGUE_TO_SPORT_KEY.get(league)
+
+    if not sport_key:
+        # Try to find a partial match
+        for key, value in LEAGUE_TO_SPORT_KEY.items():
+            if key in league or league in key:
+                sport_key = value
+                break
+
+    if not sport_key:
+        return {
+            "result": "Pending",
+            "confidence": "low",
+            "final_score": "",
+            "reasoning": f"Unknown league: {league}. Manual grading needed."
+        }
+
+    # Fetch scores from The Odds API
+    scores = fetch_scores_from_odds_api(sport_key, days_from=7)
+
+    if not scores:
+        return {
+            "result": "Pending",
+            "confidence": "low",
+            "final_score": "",
+            "reasoning": "Could not fetch scores from API"
+        }
+
+    # Find the matching game
+    game_score = find_game_score(bet, scores)
+
+    if not game_score.get('found'):
+        return {
+            "result": "Pending",
+            "confidence": "low",
+            "final_score": "",
+            "reasoning": "Game not found in recent scores (may not have been played yet)"
+        }
+
+    # Grade the bet using the actual score
+    return grade_bet_with_score(bet, game_score)
+
+
+def update_bet_result(row_num: int, result: str, net_result: float, notes: str):
+    """Update a bet's result in the sheet."""
+    worksheet = get_google_sheet()
+
+    # Column M (13) = Result, Column N (14) = Net Result, Column R (18) = Notes
+    worksheet.update_cell(row_num, 13, result)  # Result
+    worksheet.update_cell(row_num, 14, net_result)  # Net Result
+
+    # Append grading notes to existing notes
+    existing_notes = worksheet.cell(row_num, 18).value or ""
+    new_notes = f"{existing_notes} | GRADED: {notes}" if existing_notes else f"GRADED: {notes}"
+    worksheet.update_cell(row_num, 18, new_notes[:500])  # Notes (truncate if too long)
+
+
+# ============================================================================
 # TELEGRAM BOT HANDLERS
 # ============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -229,6 +456,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/start - Show this message\n"
         "/status - Check if I'm connected properly\n"
+        "/grade - Grade all pending bets\n"
         "/help - Get help with sending bet slips"
     )
 
@@ -269,11 +497,111 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Send ALL photos at once (or quickly one after another)\n"
         "3. I'll ask who the trader is ONCE for all slips\n"
         "4. I'll process them all and log to the spreadsheet\n\n"
+        "Commands:\n"
+        "/grade - Grade all pending bets\n\n"
         "Tips:\n"
         "• Good lighting helps accuracy\n"
         "• Avoid blurry photos\n"
         "• Multiple slips per photo is fine too!"
     )
+
+
+async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /grade command - grade all pending bets."""
+    await update.message.reply_text("🔍 Fetching pending bets...")
+
+    try:
+        # Get all pending bets
+        pending_bets = get_pending_bets()
+
+        if not pending_bets:
+            await update.message.reply_text("✅ No pending bets to grade!")
+            return
+
+        await update.message.reply_text(
+            f"📊 Found {len(pending_bets)} pending bet(s). Grading now...\n"
+            "Fetching scores from The Odds API..."
+        )
+
+        graded = []
+        errors = []
+
+        for bet in pending_bets:
+            try:
+                # Grade the bet using The Odds API
+                grade_result = grade_bet(bet)
+
+                result = grade_result.get("result", "Pending")
+
+                # Skip if still pending (game not played yet)
+                if result.lower() == "pending":
+                    continue
+
+                # Calculate net result
+                try:
+                    wager = float(bet['wager'].replace('$', '').replace(',', '') if bet['wager'] else 0)
+                    potential_payout = float(bet['potential_payout'].replace('$', '').replace(',', '') if bet['potential_payout'] else 0)
+
+                    if result.lower() == "win":
+                        net_result = potential_payout - wager
+                    elif result.lower() == "loss":
+                        net_result = -wager
+                    else:  # Push
+                        net_result = 0
+                except:
+                    net_result = 0
+
+                # Update the sheet
+                notes = f"{grade_result.get('final_score', '')} - {grade_result.get('reasoning', '')}"
+                update_bet_result(bet['row_num'], result, net_result, notes)
+
+                # Track for summary
+                confidence = grade_result.get('confidence', 'unknown')
+                graded.append({
+                    "selection": bet['selection'][:25],
+                    "result": result,
+                    "confidence": confidence,
+                    "score": grade_result.get('final_score', 'N/A'),
+                })
+
+            except Exception as e:
+                errors.append(f"{bet['selection'][:20]}: {str(e)[:30]}")
+                logger.error(f"Error grading bet {bet['selection']}: {e}")
+
+        # Send summary
+        if graded:
+            summary_lines = []
+            for g in graded[:20]:
+                emoji = "✅" if g['result'] == "Win" else "❌" if g['result'] == "Loss" else "➖"
+                conf = "⚠️" if g['confidence'] == "low" else ""
+                summary_lines.append(f"{emoji} {g['selection']} → {g['result']} {conf}\n   Score: {g['score']}")
+
+            summary = "\n".join(summary_lines)
+            if len(graded) > 20:
+                summary += f"\n... and {len(graded) - 20} more"
+
+            wins = sum(1 for g in graded if g['result'] == "Win")
+            losses = sum(1 for g in graded if g['result'] == "Loss")
+            pushes = sum(1 for g in graded if g['result'] == "Push")
+
+            await update.message.reply_text(
+                f"🎯 Graded {len(graded)} bet(s)!\n\n"
+                f"Wins: {wins} | Losses: {losses} | Pushes: {pushes}\n\n"
+                f"{summary}"
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ No bets were graded.\n"
+                "Either games haven't been played yet, or results couldn't be found."
+            )
+
+        if errors:
+            error_text = "\n".join(errors[:5])
+            await update.message.reply_text(f"⚠️ Some errors occurred:\n{error_text}")
+
+    except Exception as e:
+        logger.error(f"Error in grade command: {e}")
+        await update.message.reply_text(f"❌ Error grading bets: {str(e)[:100]}")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -464,6 +792,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("grade", grade_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CallbackQueryHandler(handle_trader_selection, pattern="^trader_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -79,6 +79,9 @@ def append_bet_to_sheet(bet_data: dict):
     # Get the next row number (current rows + 1)
     next_row = len(worksheet.get_all_values()) + 1
 
+    # Net Result formula: Win = payout - wager, Loss = -wager, Push = 0
+    net_result_formula = f'=IF(M{next_row}="Win",L{next_row}-K{next_row},IF(M{next_row}="Loss",-K{next_row},IF(M{next_row}="Push",0,0)))'
+
     # Commission formula: if payout/wager >= 2, use 1% of wager; else 1% of profit
     # Commission is owed on ALL bets (win, loss, or push) based on potential payout
     commission_formula = f'=IF(L{next_row}/K{next_row}>=2,K{next_row}*0.01,(L{next_row}-K{next_row})*0.01)'
@@ -102,7 +105,7 @@ def append_bet_to_sheet(bet_data: dict):
         bet_data.get("wager_amount", ""),
         bet_data.get("potential_payout", ""),
         bet_data.get("result", ""),
-        bet_data.get("net_result", ""),
+        net_result_formula,  # Net Result calculated by formula based on Result column
         commission_formula,  # Commission calculated by formula
         bet_data.get("status", ""),
         bet_data.get("raw_text", ""),
@@ -312,16 +315,21 @@ SEARCH RESULTS:
 GRADING RULES:
 - SPREAD BETS: "Team -3.5" means that team must win by MORE than 3.5 points. "Team +3.5" means that team can lose by up to 3 points and still cover.
 - MONEYLINE (ML): Just check which team won the game
-- OVER/UNDER: Add both teams' scores and compare to the line
+- OVER/UNDER: You MUST add both teams' scores together and compare to the line.
+  * Example: If line is "Over 237" and score is 123-113, total is 123+113=236. Since 236 < 237, the OVER loses.
+  * OVER wins if total > line, loses if total < line
+  * UNDER wins if total < line, loses if total > line
 - 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
 - If the margin exactly equals a whole number spread (no .5), it's a PUSH
 - If you cannot determine the result from the search, return "Pending"
 
+IMPORTANT: For Over/Under bets, ALWAYS show your math in the reasoning (e.g., "123 + 113 = 236, which is under 237, so Over loses")
+
 Return ONLY a JSON object:
 {{
     "result": "Win" or "Loss" or "Push" or "Pending",
-    "final_score": "the score used for grading (e.g., 'Minnesota 35 - Wisconsin 28' or '1H: Minnesota 18 - Wisconsin 14')",
-    "reasoning": "brief explanation of why bet won/lost/pushed",
+    "final_score": "the score used for grading (e.g., 'Spurs 123 - Pacers 113')",
+    "reasoning": "SHOW YOUR MATH for over/under bets (e.g., '123 + 113 = 236 < 237, Over loses')",
     "confidence": "high" or "medium" or "low"
 }}"""
 
@@ -371,13 +379,13 @@ def grade_bet(bet: dict) -> dict:
     return grade_bet_with_search(bet, search_results)
 
 
-def update_bet_result(row_num: int, result: str, net_result: float, notes: str):
-    """Update a bet's result in the sheet."""
+def update_bet_result(row_num: int, result: str, notes: str):
+    """Update a bet's result in the sheet. Net Result is calculated by formula."""
     worksheet = get_google_sheet()
 
-    # Column M (13) = Result, Column N (14) = Net Result, Column R (18) = Notes
-    worksheet.update_cell(row_num, 13, result)  # Result
-    worksheet.update_cell(row_num, 14, net_result)  # Net Result
+    # Column M (13) = Result, Column R (18) = Notes
+    # Note: Column N (Net Result) has a formula that auto-calculates based on Result
+    worksheet.update_cell(row_num, 13, result)  # Result - this triggers the Net Result formula
 
     # Append grading notes to existing notes
     existing_notes = worksheet.cell(row_num, 18).value or ""
@@ -484,23 +492,9 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         not_found.append(f"• {bet['teams_event'][:30]} ({bet['league']})")
                     continue
 
-                # Calculate net result
-                try:
-                    wager = float(bet['wager'].replace('$', '').replace(',', '') if bet['wager'] else 0)
-                    potential_payout = float(bet['potential_payout'].replace('$', '').replace(',', '') if bet['potential_payout'] else 0)
-
-                    if result.lower() == "win":
-                        net_result = potential_payout - wager
-                    elif result.lower() == "loss":
-                        net_result = -wager
-                    else:  # Push
-                        net_result = 0
-                except:
-                    net_result = 0
-
-                # Update the sheet
+                # Update the sheet (Net Result is calculated by formula based on Result)
                 notes = f"{grade_result.get('final_score', '')} - {grade_result.get('reasoning', '')}"
-                update_bet_result(bet['row_num'], result, net_result, notes)
+                update_bet_result(bet['row_num'], result, notes)
 
                 # Track for summary
                 confidence = grade_result.get('confidence', 'unknown')

@@ -282,41 +282,161 @@ def fetch_scores_from_odds_api(sport_key: str, days_from: int = 3) -> list:
         return []
 
 
+def normalize_team_name(name: str) -> list:
+    """Return multiple variations of a team name for matching."""
+    name = name.lower().strip()
+    variations = [name]
+
+    # Common team name mappings (API name -> common alternatives)
+    team_aliases = {
+        "los angeles lakers": ["lakers", "la lakers", "lal"],
+        "los angeles clippers": ["clippers", "la clippers", "lac"],
+        "golden state warriors": ["warriors", "gsw", "golden state"],
+        "san antonio spurs": ["spurs", "sa spurs", "sas"],
+        "oklahoma city thunder": ["thunder", "okc", "oklahoma city"],
+        "new york knicks": ["knicks", "ny knicks", "nyk"],
+        "new york yankees": ["yankees", "ny yankees", "nyy"],
+        "new york mets": ["mets", "ny mets", "nym"],
+        "boston celtics": ["celtics", "boston", "bos"],
+        "boston red sox": ["red sox", "boston", "bos"],
+        "chicago bulls": ["bulls", "chicago", "chi"],
+        "chicago cubs": ["cubs", "chicago", "chc"],
+        "chicago white sox": ["white sox", "sox", "chw"],
+        "miami heat": ["heat", "miami", "mia"],
+        "philadelphia 76ers": ["76ers", "sixers", "philly", "phi"],
+        "philadelphia eagles": ["eagles", "philly", "phi"],
+        "phoenix suns": ["suns", "phoenix", "phx"],
+        "denver nuggets": ["nuggets", "denver", "den"],
+        "milwaukee bucks": ["bucks", "milwaukee", "mil"],
+        "dallas mavericks": ["mavericks", "mavs", "dallas", "dal"],
+        "minnesota timberwolves": ["timberwolves", "wolves", "minnesota", "min"],
+        "new orleans pelicans": ["pelicans", "new orleans", "nop"],
+        "kansas city chiefs": ["chiefs", "kc", "kansas city"],
+        "san francisco 49ers": ["49ers", "niners", "sf", "san francisco"],
+        "tampa bay buccaneers": ["buccaneers", "bucs", "tampa", "tb"],
+        "green bay packers": ["packers", "green bay", "gb"],
+        "new england patriots": ["patriots", "pats", "new england", "ne"],
+        "las vegas raiders": ["raiders", "vegas", "lv"],
+        "los angeles rams": ["rams", "la rams", "lar"],
+        "los angeles chargers": ["chargers", "la chargers", "lac"],
+        "los angeles dodgers": ["dodgers", "la dodgers", "lad"],
+        "los angeles angels": ["angels", "la angels", "laa"],
+        "new york giants": ["giants", "ny giants", "nyg"],
+        "new york jets": ["jets", "ny jets", "nyj"],
+    }
+
+    # Add aliases if found
+    for full_name, aliases in team_aliases.items():
+        if full_name in name or name in full_name:
+            variations.extend(aliases)
+
+    # Also add individual words (last word is usually the team name)
+    words = name.split()
+    if words:
+        variations.append(words[-1])  # Last word (e.g., "Lakers" from "Los Angeles Lakers")
+        if len(words) > 1:
+            variations.append(words[-1])
+
+    return list(set(variations))
+
+
+def extract_teams_from_event(teams_event: str) -> list:
+    """Extract team names from various formats like 'Team1 @ Team2', 'Team1 vs Team2', etc."""
+    teams_event = teams_event.lower().strip()
+
+    # Try different separators
+    for sep in [' @ ', ' vs ', ' v ', ' at ', ' - ']:
+        if sep in teams_event:
+            parts = teams_event.split(sep)
+            if len(parts) == 2:
+                return [parts[0].strip(), parts[1].strip()]
+
+    return [teams_event]  # Return whole string if can't split
+
+
+def team_matches(team_from_sheet: str, team_from_api: str) -> bool:
+    """Check if a team name from the sheet matches one from the API."""
+    sheet_team = team_from_sheet.lower().strip()
+    api_team = team_from_api.lower().strip()
+
+    # Direct match
+    if sheet_team == api_team:
+        return True
+
+    # Sheet team is contained in API team (e.g., "Minnesota" in "Minnesota Golden Gophers")
+    if sheet_team in api_team:
+        return True
+
+    # API team is contained in sheet team
+    if api_team in sheet_team:
+        return True
+
+    # Check if first word matches (often the city/school name)
+    sheet_first = sheet_team.split()[0] if sheet_team.split() else ""
+    api_first = api_team.split()[0] if api_team.split() else ""
+    if sheet_first and api_first and sheet_first == api_first and len(sheet_first) > 3:
+        return True
+
+    # Check variations/aliases
+    sheet_variations = normalize_team_name(sheet_team)
+    api_variations = normalize_team_name(api_team)
+
+    for sv in sheet_variations:
+        for av in api_variations:
+            if sv == av or sv in api_team or av in sheet_team:
+                return True
+
+    return False
+
+
 def find_game_score(bet: dict, scores: list) -> dict:
     """Find the matching game score for a bet."""
-    teams_event = bet['teams_event'].lower()
+    teams_event = bet['teams_event']
+    logger.info(f"Looking for game matching: {teams_event}")
+
+    # Extract the two teams from the event string
+    teams_from_sheet = extract_teams_from_event(teams_event)
+    logger.info(f"Extracted teams: {teams_from_sheet}")
 
     for game in scores:
         if not game.get('completed'):
             continue
 
-        home_team = game.get('home_team', '').lower()
-        away_team = game.get('away_team', '').lower()
+        home_team = game.get('home_team', '')
+        away_team = game.get('away_team', '')
 
-        # Check if both teams are mentioned in the bet
-        if (home_team in teams_event or any(word in teams_event for word in home_team.split())) and \
-           (away_team in teams_event or any(word in teams_event for word in away_team.split())):
-            # Found the game - extract scores
-            scores_list = game.get('scores', [])
-            if scores_list:
-                home_score = None
-                away_score = None
-                for score in scores_list:
-                    if score['name'].lower() == home_team:
-                        home_score = int(score['score'])
-                    elif score['name'].lower() == away_team:
-                        away_score = int(score['score'])
+        # Check if both teams match
+        if len(teams_from_sheet) == 2:
+            team1, team2 = teams_from_sheet
 
-                if home_score is not None and away_score is not None:
-                    return {
-                        "found": True,
-                        "home_team": game['home_team'],
-                        "away_team": game['away_team'],
-                        "home_score": home_score,
-                        "away_score": away_score,
-                        "completed": True
-                    }
+            # Check both orderings (team1 could be home or away)
+            match1 = (team_matches(team1, home_team) and team_matches(team2, away_team))
+            match2 = (team_matches(team1, away_team) and team_matches(team2, home_team))
 
+            if match1 or match2:
+                logger.info(f"Found match: {away_team} @ {home_team}")
+                # Found the game - extract scores
+                scores_list = game.get('scores', [])
+                if scores_list:
+                    home_score = None
+                    away_score = None
+                    for score in scores_list:
+                        if score['name'].lower() == home_team.lower():
+                            home_score = int(score['score'])
+                        elif score['name'].lower() == away_team.lower():
+                            away_score = int(score['score'])
+
+                    if home_score is not None and away_score is not None:
+                        return {
+                            "found": True,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "home_score": home_score,
+                            "away_score": away_score,
+                            "completed": True
+                        }
+
+    logger.info(f"No match found for: {teams_event}")
     return {"found": False}
 
 
@@ -525,6 +645,7 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         graded = []
         errors = []
+        not_found = []
 
         for bet in pending_bets:
             try:
@@ -533,8 +654,11 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 result = grade_result.get("result", "Pending")
 
-                # Skip if still pending (game not played yet)
+                # Track games that couldn't be found
                 if result.lower() == "pending":
+                    reason = grade_result.get('reasoning', '')
+                    if 'not found' in reason.lower() or 'unknown league' in reason.lower():
+                        not_found.append(f"• {bet['teams_event'][:30]} ({bet['league']})")
                     continue
 
                 # Calculate net result
@@ -593,6 +717,15 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "ℹ️ No bets were graded.\n"
                 "Either games haven't been played yet, or results couldn't be found."
+            )
+
+        if not_found:
+            not_found_text = "\n".join(not_found[:10])
+            if len(not_found) > 10:
+                not_found_text += f"\n... and {len(not_found) - 10} more"
+            await update.message.reply_text(
+                f"🔍 Couldn't match {len(not_found)} game(s):\n{not_found_text}\n\n"
+                "Check team names in your sheet match the API format."
             )
 
         if errors:

@@ -11,7 +11,6 @@ import os
 import json
 import base64
 import logging
-import asyncio
 from datetime import datetime
 from io import BytesIO
 
@@ -36,9 +35,6 @@ BETTOR_NAMES = {
     "Erich": "Erich",
     "Zak": "Zak",
 }
-
-# How long to wait for more photos before asking for trader (seconds)
-PHOTO_BATCH_TIMEOUT = 3
 
 # Logging setup
 logging.basicConfig(
@@ -280,41 +276,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def process_batch_after_timeout(context: ContextTypes.DEFAULT_TYPE):
-    """Process the batch of photos after the timeout."""
-    job = context.job
-    chat_id = job.chat_id
-    user_data = job.data
-
-    # Get pending photos
-    pending_photos = user_data.get('pending_photos', [])
-    bettor_name = user_data.get('bettor_name', 'Unknown')
-
-    if not pending_photos:
-        return
-
-    # Ask who the trader is
-    keyboard = [
-        [
-            InlineKeyboardButton("Will", callback_data="trader_Will"),
-            InlineKeyboardButton("Serge", callback_data="trader_Serge"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    photo_count = len(pending_photos)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"📸 Got {photo_count} photo{'s' if photo_count > 1 else ''}! Who was the trader?",
-        reply_markup=reply_markup
-    )
-
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming photos (bet slips) - collects multiple before asking for trader."""
+    """Handle incoming photos - collects all, asks for trader once."""
     user = update.effective_user
     username = user.username or str(user.id)
-    chat_id = update.effective_chat.id
 
     # Get bettor name from mapping, or use Telegram name
     bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
@@ -330,30 +295,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'pending_photos' not in context.user_data:
         context.user_data['pending_photos'] = []
 
+    # Check if this is the first photo (need to ask for trader)
+    is_first_photo = len(context.user_data['pending_photos']) == 0
+
     # Add this photo to the pending list
     context.user_data['pending_photos'].append(photo_bytes.getvalue())
     context.user_data['bettor_name'] = bettor_name
 
-    # Cancel any existing timeout job for this user
-    current_jobs = context.job_queue.get_jobs_by_name(f"batch_{chat_id}")
-    for job in current_jobs:
-        job.schedule_removal()
-
-    # Schedule a new timeout job - will trigger after PHOTO_BATCH_TIMEOUT seconds of no new photos
-    context.job_queue.run_once(
-        process_batch_after_timeout,
-        PHOTO_BATCH_TIMEOUT,
-        chat_id=chat_id,
-        name=f"batch_{chat_id}",
-        data=context.user_data
-    )
-
-    # Quick acknowledgment
-    photo_count = len(context.user_data['pending_photos'])
-    if photo_count == 1:
-        await update.message.reply_text("📸 Got it! Send more photos or wait a moment...")
-    else:
-        await update.message.reply_text(f"📸 +1 ({photo_count} total)")
+    if is_first_photo:
+        # First photo - ask for trader
+        keyboard = [
+            [
+                InlineKeyboardButton("Will", callback_data="trader_Will"),
+                InlineKeyboardButton("Serge", callback_data="trader_Serge"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "📸 Got it! Who was the trader?",
+            reply_markup=reply_markup
+        )
+    # Additional photos are silently added - no response needed
 
 
 async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "YOUR_GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")  # JSON string of service account
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "7716a34ed8aa5c65c5223ee84238d653")  # The Odds API key
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "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")  # Tavily search API
 
 # Map Telegram usernames/names to bettor names
 BETTOR_NAMES = {
@@ -218,28 +218,8 @@ IMPORTANT:
 
 
 # ============================================================================
-# BET GRADING WITH THE ODDS API
+# BET GRADING WITH TAVILY WEB SEARCH
 # ============================================================================
-
-# Map league names to Odds API sport keys
-LEAGUE_TO_SPORT_KEY = {
-    "NFL": "americanfootball_nfl",
-    "NBA": "basketball_nba",
-    "MLB": "baseball_mlb",
-    "NHL": "icehockey_nhl",
-    "NCAAB": "basketball_ncaab",
-    "NCAAF": "americanfootball_ncaaf",
-    "UFC": "mma_mixed_martial_arts",
-    "MMA": "mma_mixed_martial_arts",
-    "EPL": "soccer_epl",
-    "PREMIER LEAGUE": "soccer_epl",
-    "LA LIGA": "soccer_spain_la_liga",
-    "SERIE A": "soccer_italy_serie_a",
-    "BUNDESLIGA": "soccer_germany_bundesliga",
-    "MLS": "soccer_usa_mls",
-    "CHAMPIONS LEAGUE": "soccer_uefa_champs_league",
-}
-
 
 def get_pending_bets():
     """Fetch all pending bets from the sheet."""
@@ -265,209 +245,84 @@ def get_pending_bets():
     return pending_bets
 
 
-def fetch_scores_from_odds_api(sport_key: str, days_from: int = 3) -> list:
-    """Fetch completed game scores from The Odds API."""
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "daysFrom": days_from,  # Look back this many days
-    }
+def search_game_result(bet: dict) -> str:
+    """Search for game result using Tavily API."""
+    # Build search query from bet info
+    match_date = bet['match_date']
+    league = bet['league']
+    teams = bet['teams_event']
+    selection = bet['selection']
+
+    # Check if it's a quarter/half bet
+    is_partial = any(x in selection.lower() for x in ['1q', '2q', '3q', '4q', '1h', '2h', 'first quarter', 'first half', 'second half'])
+
+    if is_partial:
+        query = f"{teams} {league} {match_date} box score quarter by quarter"
+    else:
+        query = f"{teams} {league} {match_date} final score result"
+
+    logger.info(f"Searching Tavily for: {query}")
 
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "advanced",
+                "include_answer": True,
+                "max_results": 5
+            },
+            timeout=30
+        )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+
+        # Combine the answer and top results
+        result_text = ""
+        if data.get('answer'):
+            result_text += f"Summary: {data['answer']}\n\n"
+
+        for r in data.get('results', [])[:3]:
+            result_text += f"Source: {r.get('title', '')}\n{r.get('content', '')}\n\n"
+
+        return result_text if result_text else "No results found"
+
     except Exception as e:
-        logger.error(f"Error fetching scores from Odds API: {e}")
-        return []
+        logger.error(f"Tavily search error: {e}")
+        return f"Search error: {str(e)}"
 
 
-def normalize_team_name(name: str) -> list:
-    """Return multiple variations of a team name for matching."""
-    name = name.lower().strip()
-    variations = [name]
-
-    # Common team name mappings (API name -> common alternatives)
-    team_aliases = {
-        "los angeles lakers": ["lakers", "la lakers", "lal"],
-        "los angeles clippers": ["clippers", "la clippers", "lac"],
-        "golden state warriors": ["warriors", "gsw", "golden state"],
-        "san antonio spurs": ["spurs", "sa spurs", "sas"],
-        "oklahoma city thunder": ["thunder", "okc", "oklahoma city"],
-        "new york knicks": ["knicks", "ny knicks", "nyk"],
-        "new york yankees": ["yankees", "ny yankees", "nyy"],
-        "new york mets": ["mets", "ny mets", "nym"],
-        "boston celtics": ["celtics", "boston", "bos"],
-        "boston red sox": ["red sox", "boston", "bos"],
-        "chicago bulls": ["bulls", "chicago", "chi"],
-        "chicago cubs": ["cubs", "chicago", "chc"],
-        "chicago white sox": ["white sox", "sox", "chw"],
-        "miami heat": ["heat", "miami", "mia"],
-        "philadelphia 76ers": ["76ers", "sixers", "philly", "phi"],
-        "philadelphia eagles": ["eagles", "philly", "phi"],
-        "phoenix suns": ["suns", "phoenix", "phx"],
-        "denver nuggets": ["nuggets", "denver", "den"],
-        "milwaukee bucks": ["bucks", "milwaukee", "mil"],
-        "dallas mavericks": ["mavericks", "mavs", "dallas", "dal"],
-        "minnesota timberwolves": ["timberwolves", "wolves", "minnesota", "min"],
-        "new orleans pelicans": ["pelicans", "new orleans", "nop"],
-        "kansas city chiefs": ["chiefs", "kc", "kansas city"],
-        "san francisco 49ers": ["49ers", "niners", "sf", "san francisco"],
-        "tampa bay buccaneers": ["buccaneers", "bucs", "tampa", "tb"],
-        "green bay packers": ["packers", "green bay", "gb"],
-        "new england patriots": ["patriots", "pats", "new england", "ne"],
-        "las vegas raiders": ["raiders", "vegas", "lv"],
-        "los angeles rams": ["rams", "la rams", "lar"],
-        "los angeles chargers": ["chargers", "la chargers", "lac"],
-        "los angeles dodgers": ["dodgers", "la dodgers", "lad"],
-        "los angeles angels": ["angels", "la angels", "laa"],
-        "new york giants": ["giants", "ny giants", "nyg"],
-        "new york jets": ["jets", "ny jets", "nyj"],
-    }
-
-    # Add aliases if found
-    for full_name, aliases in team_aliases.items():
-        if full_name in name or name in full_name:
-            variations.extend(aliases)
-
-    # Also add individual words (last word is usually the team name)
-    words = name.split()
-    if words:
-        variations.append(words[-1])  # Last word (e.g., "Lakers" from "Los Angeles Lakers")
-        if len(words) > 1:
-            variations.append(words[-1])
-
-    return list(set(variations))
-
-
-def extract_teams_from_event(teams_event: str) -> list:
-    """Extract team names from various formats like 'Team1 @ Team2', 'Team1 vs Team2', etc."""
-    teams_event = teams_event.lower().strip()
-
-    # Try different separators
-    for sep in [' @ ', ' vs ', ' v ', ' at ', ' - ']:
-        if sep in teams_event:
-            parts = teams_event.split(sep)
-            if len(parts) == 2:
-                return [parts[0].strip(), parts[1].strip()]
-
-    return [teams_event]  # Return whole string if can't split
-
-
-def team_matches(team_from_sheet: str, team_from_api: str) -> bool:
-    """Check if a team name from the sheet matches one from the API."""
-    sheet_team = team_from_sheet.lower().strip()
-    api_team = team_from_api.lower().strip()
-
-    # Direct match
-    if sheet_team == api_team:
-        return True
-
-    # Sheet team is contained in API team (e.g., "Minnesota" in "Minnesota Golden Gophers")
-    if sheet_team in api_team:
-        return True
-
-    # API team is contained in sheet team
-    if api_team in sheet_team:
-        return True
-
-    # Check if first word matches (often the city/school name)
-    sheet_first = sheet_team.split()[0] if sheet_team.split() else ""
-    api_first = api_team.split()[0] if api_team.split() else ""
-    if sheet_first and api_first and sheet_first == api_first and len(sheet_first) > 3:
-        return True
-
-    # Check variations/aliases
-    sheet_variations = normalize_team_name(sheet_team)
-    api_variations = normalize_team_name(api_team)
-
-    for sv in sheet_variations:
-        for av in api_variations:
-            if sv == av or sv in api_team or av in sheet_team:
-                return True
-
-    return False
-
-
-def find_game_score(bet: dict, scores: list) -> dict:
-    """Find the matching game score for a bet."""
-    teams_event = bet['teams_event']
-    logger.info(f"Looking for game matching: {teams_event}")
-
-    # Extract the two teams from the event string
-    teams_from_sheet = extract_teams_from_event(teams_event)
-    logger.info(f"Extracted teams: {teams_from_sheet}")
-
-    for game in scores:
-        if not game.get('completed'):
-            continue
-
-        home_team = game.get('home_team', '')
-        away_team = game.get('away_team', '')
-
-        # Check if both teams match
-        if len(teams_from_sheet) == 2:
-            team1, team2 = teams_from_sheet
-
-            # Check both orderings (team1 could be home or away)
-            match1 = (team_matches(team1, home_team) and team_matches(team2, away_team))
-            match2 = (team_matches(team1, away_team) and team_matches(team2, home_team))
-
-            if match1 or match2:
-                logger.info(f"Found match: {away_team} @ {home_team}")
-                # Found the game - extract scores
-                scores_list = game.get('scores', [])
-                if scores_list:
-                    home_score = None
-                    away_score = None
-                    for score in scores_list:
-                        if score['name'].lower() == home_team.lower():
-                            home_score = int(score['score'])
-                        elif score['name'].lower() == away_team.lower():
-                            away_score = int(score['score'])
-
-                    if home_score is not None and away_score is not None:
-                        return {
-                            "found": True,
-                            "home_team": home_team,
-                            "away_team": away_team,
-                            "home_score": home_score,
-                            "away_score": away_score,
-                            "completed": True
-                        }
-
-    logger.info(f"No match found for: {teams_event}")
-    return {"found": False}
-
-
-def grade_bet_with_score(bet: dict, game_score: dict) -> dict:
-    """Use Claude to grade a bet given the actual score."""
+def grade_bet_with_search(bet: dict, search_results: str) -> dict:
+    """Use Claude to grade a bet based on search results."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    score_str = f"{game_score['away_team']} {game_score['away_score']} @ {game_score['home_team']} {game_score['home_score']}"
-
-    grading_prompt = f"""Grade this sports bet based on the ACTUAL FINAL SCORE provided.
+    grading_prompt = f"""Grade this sports bet based on the search results provided.
 
 BET DETAILS:
+- Match Date: {bet['match_date']}
+- League: {bet['league']}
 - Teams/Event: {bet['teams_event']}
 - Selection: {bet['selection']}
 - Bet Type: {bet['bet_type']}
-- Odds: {bet['odds']}
 
-ACTUAL FINAL SCORE:
-{score_str}
-(Home: {game_score['home_team']} {game_score['home_score']}, Away: {game_score['away_team']} {game_score['away_score']})
+SEARCH RESULTS:
+{search_results}
 
 GRADING RULES:
-- SPREAD BETS: "Team -3.5" means that team must win by MORE than 3.5 points. "Team +3.5" means that team can lose by up to 3 points and still win the bet.
-- MONEYLINE: Just check which team won
-- OVER/UNDER: Add both scores together and compare to the line
+- SPREAD BETS: "Team -3.5" means that team must win by MORE than 3.5 points. "Team +3.5" means that team can lose by up to 3 points and still cover.
+- MONEYLINE (ML): Just check which team won the game
+- OVER/UNDER: Add both teams' scores and compare to the line
+- 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
 - If the margin exactly equals a whole number spread (no .5), it's a PUSH
+- If you cannot determine the result from the search, return "Pending"
 
 Return ONLY a JSON object:
 {{
-    "result": "Win" or "Loss" or "Push",
-    "reasoning": "brief explanation (e.g., 'Lakers won by 7, covering -3.5 spread')"
+    "result": "Win" or "Loss" or "Push" or "Pending",
+    "final_score": "the score used for grading (e.g., 'Minnesota 35 - Wisconsin 28' or '1H: Minnesota 18 - Wisconsin 14')",
+    "reasoning": "brief explanation of why bet won/lost/pushed",
+    "confidence": "high" or "medium" or "low"
 }}"""
 
     try:
@@ -487,65 +342,33 @@ Return ONLY a JSON object:
         else:
             json_str = response_text
 
-        result = json.loads(json_str.strip())
-        result['final_score'] = score_str
-        result['confidence'] = 'high'  # High confidence since we have real scores
-        return result
+        return json.loads(json_str.strip())
 
     except Exception as e:
         logger.error(f"Error grading bet with Claude: {e}")
         return {
             "result": "Pending",
             "confidence": "low",
-            "final_score": score_str,
+            "final_score": "",
             "reasoning": f"Error grading: {str(e)[:50]}"
         }
 
 
 def grade_bet(bet: dict) -> dict:
-    """Main function to grade a single bet using The Odds API."""
-    league = bet['league'].upper().strip()
-    sport_key = LEAGUE_TO_SPORT_KEY.get(league)
+    """Main function to grade a single bet using Tavily search."""
+    # Search for the game result
+    search_results = search_game_result(bet)
 
-    if not sport_key:
-        # Try to find a partial match
-        for key, value in LEAGUE_TO_SPORT_KEY.items():
-            if key in league or league in key:
-                sport_key = value
-                break
-
-    if not sport_key:
+    if "error" in search_results.lower() or search_results == "No results found":
         return {
             "result": "Pending",
             "confidence": "low",
             "final_score": "",
-            "reasoning": f"Unknown league: {league}. Manual grading needed."
+            "reasoning": "Could not find game results"
         }
 
-    # Fetch scores from The Odds API
-    scores = fetch_scores_from_odds_api(sport_key, days_from=7)
-
-    if not scores:
-        return {
-            "result": "Pending",
-            "confidence": "low",
-            "final_score": "",
-            "reasoning": "Could not fetch scores from API"
-        }
-
-    # Find the matching game
-    game_score = find_game_score(bet, scores)
-
-    if not game_score.get('found'):
-        return {
-            "result": "Pending",
-            "confidence": "low",
-            "final_score": "",
-            "reasoning": "Game not found in recent scores (may not have been played yet)"
-        }
-
-    # Grade the bet using the actual score
-    return grade_bet_with_score(bet, game_score)
+    # Grade the bet using Claude with the search results
+    return grade_bet_with_search(bet, search_results)
 
 
 def update_bet_result(row_num: int, result: str, net_result: float, notes: str):
@@ -640,7 +463,7 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"📊 Found {len(pending_bets)} pending bet(s). Grading now...\n"
-            "Fetching scores from The Odds API..."
+            "Searching for game results..."
         )
 
         graded = []

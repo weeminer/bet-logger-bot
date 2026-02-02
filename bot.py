@@ -313,17 +313,40 @@ SEARCH RESULTS:
 {search_results}
 
 GRADING RULES:
-- SPREAD BETS: "Team -3.5" means that team must win by MORE than 3.5 points. "Team +3.5" means that team can lose by up to 3 points and still cover.
-- MONEYLINE (ML): Just check which team won the game
-- OVER/UNDER: You MUST add both teams' scores together and compare to the line.
-  * Example: If line is "Over 237" and score is 123-113, total is 123+113=236. Since 236 < 237, the OVER loses.
-  * OVER wins if total > line, loses if total < line
-  * UNDER wins if total < line, loses if total > line
-- 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
-- If the margin exactly equals a whole number spread (no .5), it's a PUSH
-- If you cannot determine the result from the search, return "Pending"
 
-IMPORTANT: For Over/Under bets, ALWAYS show your math in the reasoning (e.g., "123 + 113 = 236, which is under 237, so Over loses")
+SPREAD BETS - FOLLOW THESE STEPS:
+1. Identify the TEAM the bet is on (from the selection)
+2. Calculate: (Bet Team's score) - (Opponent's score) = margin (can be negative if they lost!)
+3. For NEGATIVE spreads (favorite, e.g., "Warriors -8"):
+   - The bet team must win by MORE than the spread number
+   - Check: Is margin > spread number?
+   * Example: Warriors -8, Warriors win 140-124. Margin = 140-124 = +16. Is +16 > 8? YES → WIN
+   * Example: Warriors -8, Warriors win 132-124. Margin = 132-124 = +8. Is +8 > 8? NO (equal) → PUSH
+   * Example: Warriors -8, Warriors lose 124-140. Margin = 124-140 = -16. Is -16 > 8? NO → LOSS
+   * Example: Warriors -8, Warriors win 130-124. Margin = 130-124 = +6. Is +6 > 8? NO → LOSS
+4. For POSITIVE spreads (underdog, e.g., "Jazz +8"):
+   - The bet team can lose by LESS than the spread number (or win outright)
+   - Check: Is margin > -(spread number)?
+   * Example: Jazz +8, Jazz lose 124-140. Margin = 124-140 = -16. Is -16 > -8? NO → LOSS
+   * Example: Jazz +8, Jazz lose 130-136. Margin = 130-136 = -6. Is -6 > -8? YES → WIN
+   * Example: Jazz +8, Jazz lose 128-136. Margin = 128-136 = -8. Is -8 > -8? NO (equal) → PUSH
+   * Example: Jazz +8, Jazz win 140-130. Margin = 140-130 = +10. Is +10 > -8? YES → WIN
+
+OVER/UNDER - FOLLOW THESE STEPS:
+1. Add both teams' scores: Team1 + Team2 = total
+2. OVER wins if total > line, loses if total < line, PUSH if equal
+3. UNDER wins if total < line, loses if total > line, PUSH if equal
+   * Example: Over 237, score 123-113. Total = 123+113 = 236. Is 236 > 237? NO → LOSS
+   * Example: Over 264, score 140-124. Total = 140+124 = 264. Is 264 > 264? NO (equal) → PUSH
+   * Example: Under 237, score 123-113. Total = 236. Is 236 < 237? YES → WIN
+
+MONEYLINE (ML): Just check which team won the game
+
+1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
+
+If you cannot determine the result from the search, return "Pending"
+
+IMPORTANT: ALWAYS show your math step-by-step in the reasoning field!
 
 Return ONLY a JSON object:
 {{
@@ -362,8 +385,81 @@ Return ONLY a JSON object:
         }
 
 
+def verify_grade(bet: dict, initial_grade: dict, search_results: str) -> dict:
+    """Double-check the grading with a verification call."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    verify_prompt = f"""VERIFICATION CHECK: Please verify if this bet was graded correctly.
+
+BET DETAILS:
+- Teams/Event: {bet['teams_event']}
+- Selection: {bet['selection']}
+- Bet Type: {bet['bet_type']}
+
+SEARCH RESULTS:
+{search_results}
+
+INITIAL GRADE:
+- Result: {initial_grade.get('result')}
+- Score: {initial_grade.get('final_score')}
+- Reasoning: {initial_grade.get('reasoning')}
+
+YOUR TASK:
+1. Find the actual score in the search results
+2. Re-calculate whether the bet won or lost using these rules:
+
+SPREAD BETS:
+- Calculate margin: (Bet Team's score) - (Opponent's score) = margin (can be negative!)
+- Negative spread (Team -8): Team must win by MORE than 8 → check if margin > 8
+  * Warriors -8, Warriors win 140-124: margin = 140-124 = +16. Is +16 > 8? YES → WIN
+  * Warriors -8, Warriors lose 124-140: margin = 124-140 = -16. Is -16 > 8? NO → LOSS
+  * Warriors -8, Warriors win 132-124: margin = +8. Is +8 > 8? NO (equal) → PUSH
+- Positive spread (Team +8): Team can lose by less than 8 → check if margin > -8
+  * Jazz +8, Jazz lose 124-140: margin = -16. Is -16 > -8? NO → LOSS
+  * Jazz +8, Jazz lose 130-136: margin = -6. Is -6 > -8? YES → WIN
+
+OVER/UNDER:
+- Add both scores: total = score1 + score2
+- Over wins if total > line, PUSH if equal
+- Under wins if total < line, PUSH if equal
+
+3. Compare your answer to the initial grade
+4. SHOW YOUR MATH
+
+Return JSON:
+{{
+    "verified_result": "Win" or "Loss" or "Push" or "Pending",
+    "actual_score": "the score you found",
+    "your_math": "show your calculation",
+    "agrees_with_initial": true or false,
+    "confidence": "high" or "medium" or "low"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": verify_prompt}]
+        )
+
+        response_text = response.content[0].text
+
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0]
+        else:
+            json_str = response_text
+
+        return json.loads(json_str.strip())
+
+    except Exception as e:
+        logger.error(f"Verification error: {e}")
+        return {"verified_result": initial_grade.get('result'), "agrees_with_initial": True, "confidence": "low"}
+
+
 def grade_bet(bet: dict) -> dict:
-    """Main function to grade a single bet using Tavily search."""
+    """Main function to grade a single bet using Tavily search with verification."""
     # Search for the game result
     search_results = search_game_result(bet)
 
@@ -375,8 +471,31 @@ def grade_bet(bet: dict) -> dict:
             "reasoning": "Could not find game results"
         }
 
-    # Grade the bet using Claude with the search results
-    return grade_bet_with_search(bet, search_results)
+    # Initial grading
+    initial_grade = grade_bet_with_search(bet, search_results)
+
+    # Skip verification for pending results
+    if initial_grade.get('result', '').lower() == 'pending':
+        return initial_grade
+
+    # Verification step
+    verification = verify_grade(bet, initial_grade, search_results)
+
+    # If verification agrees, use the initial grade
+    if verification.get('agrees_with_initial', False):
+        initial_grade['confidence'] = 'high'
+        initial_grade['reasoning'] += f" [VERIFIED: {verification.get('your_math', '')}]"
+        return initial_grade
+
+    # If verification disagrees, use the verified result but flag it
+    logger.warning(f"Grade verification mismatch for {bet['selection']}: initial={initial_grade.get('result')}, verified={verification.get('verified_result')}")
+
+    return {
+        "result": verification.get('verified_result', 'Pending'),
+        "final_score": verification.get('actual_score', initial_grade.get('final_score', '')),
+        "reasoning": f"CORRECTED: {verification.get('your_math', '')}",
+        "confidence": verification.get('confidence', 'medium')
+    }
 
 
 def update_bet_result(row_num: int, result: str, notes: str):

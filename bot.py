@@ -129,36 +129,55 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     # Convert image to base64
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    # Prompt for structured extraction - MULTIPLE SLIPS
+    # Prompt for structured extraction - MULTIPLE SLIPS INCLUDING PARLAYS
     extraction_prompt = """Analyze this image and extract information from ALL bet slips visible.
 
-Return a JSON ARRAY of objects, one for each bet slip found. Each object should have these fields:
+Return a JSON ARRAY of objects, ONE OBJECT PER BET SLIP (not per leg). Each object should have these fields:
 {
-    "date_placed": "YYYY-MM-DD format, the date the BET WAS PLACED (usually shown near ticket/slip number, NOT the game date)",
+    "date_placed": "YYYY-MM-DD format, the date the BET WAS PLACED (near ticket/slip number at top)",
     "match_date": "YYYY-MM-DD format, the date of the GAME/MATCH being bet on",
-    "league": "the league (NFL, NBA, MLB, NHL, UFC, MLS, Premier League, etc.)",
-    "teams_event": "the teams or event (e.g., 'Lakers vs Celtics' or 'Chiefs vs Ravens')",
-    "selection": "what we bet ON specifically (e.g., 'Lakers -3.5', 'Over 45.5', 'Chiefs ML', 'Patrick Mahomes 300+ yards')",
-    "bet_type": "type of bet (Straight, Parlay, Teaser, Prop, Over/Under, Moneyline, Spread, etc.)",
-    "odds": "the odds as shown (e.g., -110, +150, -3.5)",
-    "wager_amount": "numeric value only, the amount wagered (e.g., 100.00)",
-    "potential_payout": "numeric value only, the total potential payout if bet wins (wager + winnings)",
-    "result": "Win/Loss/Push/Pending - the outcome of the bet",
-    "confidence": "high/medium/low - how confident you are in the extraction",
-    "raw_text": "brief summary of what you can read on this slip",
-    "notes": "any issues or unclear parts"
+    "league": "the league (NFL, NBA, MLB, NHL, NCAAB, NCAAF, UFC, etc.)",
+    "teams_event": "the teams or event (e.g., 'OKC Thunder @ DEN Nuggets')",
+    "selection": "what we bet ON - see format below",
+    "bet_type": "Straight, Parlay, SGP (Same Game Parlay), Teaser, Prop, etc.",
+    "odds": "the TOTAL odds for the bet (e.g., +280, -110)",
+    "wager_amount": "numeric value only (e.g., 1197.22)",
+    "potential_payout": "numeric value only, total payout if bet wins (e.g., 4549.44)",
+    "result": "Win/Loss/Push/Pending",
+    "confidence": "high/medium/low",
+    "raw_text": "brief summary of the slip",
+    "notes": "any issues"
 }
+
+PARLAY / SGP (SAME GAME PARLAY) HANDLING:
+- A parlay is ONE bet with multiple legs - create ONE object for the entire parlay, NOT separate objects per leg
+- Look for "Parlay (X Picks)" to identify parlays
+- For the "selection" field, combine ALL legs separated by " / "
+- Example SGP with 2 legs:
+  {
+    "teams_event": "OKC Thunder @ DEN Nuggets",
+    "selection": "Shai Gilgeous-Alexander U29.5 pts / Chet Holmgren U1.5 3pt",
+    "bet_type": "SGP",
+    "odds": "+280",
+    "wager_amount": "1197.22",
+    "potential_payout": "4549.44"
+  }
+
+STRAIGHT BET EXAMPLE:
+  {
+    "teams_event": "Lakers @ Celtics",
+    "selection": "Lakers -3.5",
+    "bet_type": "Spread",
+    "odds": "-110"
+  }
 
 IMPORTANT:
 - Return a JSON ARRAY even if there's only one slip: [{ ... }]
-- Extract EVERY separate bet slip visible in the image
-- date_placed is the date the BET WAS PLACED - look for this near the ticket number, slip ID, or at the top of the slip
-- match_date is the date of the GAME being bet on
-- selection should be the specific pick (team + spread, over/under, moneyline, etc.)
-- potential_payout is the TOTAL you'd receive if you win (stake + profit)
-- result should be "Win", "Loss", "Push", or "Pending" based on what the slip shows
-- If you cannot clearly read a value, set confidence to "low" and explain in notes
-- For parlays, list all legs in teams_event and selection separated by " / "
+- ONE object per TICKET/SLIP, not per leg
+- date_placed is when the bet was placed (top of slip), match_date is when the game is
+- For parlays, the odds shown is the COMBINED parlay odds (e.g., +280)
+- potential_payout is the TOTAL you'd receive if you win
+- result should be "Pending" unless the slip shows it's already settled
 - Return ONLY the JSON array, no other text"""
 
     response = client.messages.create(
@@ -705,6 +724,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton("Will", callback_data="trader_Will"),
                 InlineKeyboardButton("Serge", callback_data="trader_Serge"),
+                InlineKeyboardButton("PYR", callback_data="trader_PYR"),
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)

@@ -66,10 +66,11 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")  # Optional: sp
 # GOOGLE SHEETS CONNECTION
 # ============================================================================
 def get_google_credentials():
-    """Get Google credentials for Sheets and Drive."""
+    """Get Google credentials for Sheets, Drive, and Vision."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/cloud-vision"
     ]
 
     if GOOGLE_CREDENTIALS_JSON:

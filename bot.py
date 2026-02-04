@@ -4,7 +4,7 @@ Bet Slip Telegram Bot
 This bot receives bet slip images via Telegram DM, extracts the data using
 Claude's Vision API, and logs it to a Google Sheet.
 
-Supports multiple photos at once - asks for trader only once for all photos.
+Supports multiple photos at once - asks for trader only once for all photos..
 """
 
 import os

@@ -31,6 +31,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "YOUR_GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")  # JSON string of service account
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "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")  # Tavily search API
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")  # imgbb API for image uploads
 
 # Map Telegram usernames/names to bettor names
 BETTOR_NAMES = {
@@ -71,61 +72,42 @@ def get_google_credentials():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def upload_image_to_drive(image_bytes: bytes, filename: str) -> str:
+def upload_image_to_imgbb(image_bytes: bytes) -> str:
     """
-    Upload an image to Google Drive and return a shareable link.
+    Upload an image to imgbb and return a shareable link.
 
     Args:
         image_bytes: The raw image bytes
-        filename: Name for the file in Drive
 
     Returns:
         A shareable link to the uploaded image, or empty string if upload fails
     """
-    try:
-        credentials = get_google_credentials()
-        service = build('drive', 'v3', credentials=credentials)
+    if not IMGBB_API_KEY:
+        logger.warning("IMGBB_API_KEY not set, skipping image upload")
+        return ""
 
-        # Prepare the file metadata
-        file_metadata = {
-            'name': filename,
-            'mimeType': 'image/jpeg'
+    try:
+        data = {
+            'key': IMGBB_API_KEY,
+            'image': base64.b64encode(image_bytes).decode('utf-8')
         }
 
-        # If a folder ID is specified, put the file in that folder
-        if GOOGLE_DRIVE_FOLDER_ID:
-            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
-
-        # Create media upload object
-        media = MediaIoBaseUpload(
-            BytesIO(image_bytes),
-            mimetype='image/jpeg',
-            resumable=True
+        response = requests.post(
+            'https://api.imgbb.com/1/upload',
+            data=data,
+            timeout=30
         )
 
-        # Upload the file
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
-        ).execute()
-
-        # Make the file viewable by anyone with the link
-        service.permissions().create(
-            fileId=file['id'],
-            body={
-                'type': 'anyone',
-                'role': 'reader'
-            }
-        ).execute()
-
-        # Return the web view link
-        link = file.get('webViewLink', '')
-        logger.info(f"Uploaded image to Drive: {filename} -> {link}")
-        return link
+        if response.status_code == 200:
+            link = response.json()['data']['url']
+            logger.info(f"Uploaded image to imgbb: {link}")
+            return link
+        else:
+            logger.error(f"imgbb upload failed: {response.status_code} - {response.text[:100]}")
+            return ""
 
     except Exception as e:
-        logger.error(f"Error uploading image to Drive: {e}")
+        logger.error(f"Error uploading image to imgbb: {e}")
         return ""
 
 
@@ -858,10 +840,8 @@ async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_
 
         # Process each photo
         for i, photo_bytes in enumerate(pending_photos):
-            # Upload image to Google Drive first
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            image_filename = f"betslip_{bettor_name}_{timestamp_str}_{i+1}.jpg"
-            image_link = upload_image_to_drive(photo_bytes, image_filename)
+            # Upload image to imgbb
+            image_link = upload_image_to_imgbb(photo_bytes)
 
             # Extract data using Claude Vision - returns a LIST of bets per photo
             extracted_bets = extract_bet_data_from_image(photo_bytes)

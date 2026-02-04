@@ -272,7 +272,8 @@ def append_bet_to_sheet(bet_data: dict):
     # A: Timestamp, B: Date Placed, C: Trader, D: Bettor, E: Match Date, F: League,
     # G: Teams/Event, H: Selection, I: Bet Type, J: Odds, K: Wager,
     # L: Potential Payout, M: Result, N: Net Result, O: Commission,
-    # P: Status, Q: Raw Text, R: Notes, S: Betslip Number, T: Odds Check, U: Image Link
+    # P: Status, Q: Raw Text, R: Notes, S: Betslip Number, T: Odds Check, U: Image Link,
+    # V: Grade Verification (filled by /grade command)
     row = [
         bet_data.get("timestamp", ""),
         bet_data.get("date_placed", ""),
@@ -295,6 +296,7 @@ def append_bet_to_sheet(bet_data: dict):
         bet_data.get("betslip_number", ""),  # Column S: Betslip Number
         odds_check_formula,  # Column T: Odds verification
         bet_data.get("image_link", ""),  # Column U: Link to saved image
+        "",  # Column V: Grade Verification (filled by /grade command)
     ]
 
     worksheet.append_row(row, value_input_option="USER_ENTERED")
@@ -556,8 +558,21 @@ Return ONLY a JSON object:
     "result": "Win" or "Loss" or "Push" or "Pending",
     "final_score": "the score used for grading (e.g., 'Spurs 123 - Pacers 113')",
     "reasoning": "SHOW YOUR MATH for over/under bets (e.g., '123 + 113 = 236 < 237, Over loses')",
-    "confidence": "high" or "medium" or "low"
-}}"""
+    "confidence": "high" or "medium" or "low",
+    "verification_details": "Specific score/stats for this bet type - see examples below"
+}}
+
+VERIFICATION_DETAILS EXAMPLES (be specific to the bet type):
+- 1Q Total bet: "1Q: PHI 31 - GSW 32, Total: 63"
+- 1H Spread bet: "1H: CHI 45 - MIL 58, Margin: -13"
+- Full game Total: "Final: LAL 110 - BOS 105, Total: 215"
+- Full game Spread: "Final: UTA 98 - IND 112, Margin: -14"
+- Moneyline: "Final: DEN 118 - DET 105, DEN wins"
+- Player prop (points): "Ace Bailey: 18 pts (line was O15.5)"
+- Player prop (3PM): "Jay Huff: 2 3PM (line was U2.5)"
+- Parlay with props: "Ace Bailey: 18 pts | Jay Huff: 2 3PM"
+
+The verification_details should be a SHORT summary that lets someone quickly verify the grade."""
 
     try:
         response = client.messages.create(
@@ -635,7 +650,8 @@ Return JSON:
     "actual_score": "the score you found",
     "your_math": "show your calculation",
     "agrees_with_initial": true or false,
-    "confidence": "high" or "medium" or "low"
+    "confidence": "high" or "medium" or "low",
+    "verification_details": "Specific score/stats (e.g., '1Q: PHI 31 - GSW 32, Total: 63' or 'Ace Bailey: 18 pts')"
 }}"""
 
     try:
@@ -688,6 +704,9 @@ def grade_bet(bet: dict) -> dict:
     if verification.get('agrees_with_initial', False):
         initial_grade['confidence'] = 'high'
         initial_grade['reasoning'] += f" [VERIFIED: {verification.get('your_math', '')}]"
+        # Use verification_details from verification if available, otherwise from initial grade
+        if verification.get('verification_details'):
+            initial_grade['verification_details'] = verification.get('verification_details')
         return initial_grade
 
     # If verification disagrees, use the verified result but flag it
@@ -697,15 +716,16 @@ def grade_bet(bet: dict) -> dict:
         "result": verification.get('verified_result', 'Pending'),
         "final_score": verification.get('actual_score', initial_grade.get('final_score', '')),
         "reasoning": f"CORRECTED: {verification.get('your_math', '')}",
-        "confidence": verification.get('confidence', 'medium')
+        "confidence": verification.get('confidence', 'medium'),
+        "verification_details": verification.get('verification_details', initial_grade.get('verification_details', ''))
     }
 
 
-def update_bet_result(row_num: int, result: str, notes: str):
+def update_bet_result(row_num: int, result: str, notes: str, verification_details: str = ""):
     """Update a bet's result in the sheet. Net Result is calculated by formula."""
     worksheet = get_google_sheet()
 
-    # Column M (13) = Result, Column R (18) = Notes
+    # Column M (13) = Result, Column R (18) = Notes, Column V (22) = Verification Details
     # Note: Column N (Net Result) has a formula that auto-calculates based on Result
     worksheet.update_cell(row_num, 13, result)  # Result - this triggers the Net Result formula
 
@@ -713,6 +733,10 @@ def update_bet_result(row_num: int, result: str, notes: str):
     existing_notes = worksheet.cell(row_num, 18).value or ""
     new_notes = f"{existing_notes} | GRADED: {notes}" if existing_notes else f"GRADED: {notes}"
     worksheet.update_cell(row_num, 18, new_notes[:500])  # Notes (truncate if too long)
+
+    # Write verification details to column V (22)
+    if verification_details:
+        worksheet.update_cell(row_num, 22, verification_details)
 
 
 # ============================================================================
@@ -821,7 +845,8 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Update the sheet (Net Result is calculated by formula based on Result)
                 notes = f"{grade_result.get('final_score', '')} - {grade_result.get('reasoning', '')}"
-                update_bet_result(bet['row_num'], result, notes)
+                verification_details = grade_result.get('verification_details', '')
+                update_bet_result(bet['row_num'], result, notes, verification_details)
 
                 # Track for summary
                 confidence = grade_result.get('confidence', 'unknown')

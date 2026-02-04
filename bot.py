@@ -521,21 +521,33 @@ GRADING RULES:
 
 SPREAD BETS - FOLLOW THESE STEPS:
 1. Identify the TEAM the bet is on (from the selection)
-2. Calculate: (Bet Team's score) - (Opponent's score) = margin (can be negative if they lost!)
-3. For NEGATIVE spreads (favorite, e.g., "Warriors -8"):
-   - The bet team must win by MORE than the spread number
-   - Check: Is margin > spread number?
-   * Example: Warriors -8, Warriors win 140-124. Margin = 140-124 = +16. Is +16 > 8? YES → WIN
-   * Example: Warriors -8, Warriors win 132-124. Margin = 132-124 = +8. Is +8 > 8? NO (equal) → PUSH
-   * Example: Warriors -8, Warriors lose 124-140. Margin = 124-140 = -16. Is -16 > 8? NO → LOSS
-   * Example: Warriors -8, Warriors win 130-124. Margin = 130-124 = +6. Is +6 > 8? NO → LOSS
-4. For POSITIVE spreads (underdog, e.g., "Jazz +8"):
-   - The bet team can lose by LESS than the spread number (or win outright)
-   - Check: Is margin > -(spread number)?
-   * Example: Jazz +8, Jazz lose 124-140. Margin = 124-140 = -16. Is -16 > -8? NO → LOSS
-   * Example: Jazz +8, Jazz lose 130-136. Margin = 130-136 = -6. Is -6 > -8? YES → WIN
-   * Example: Jazz +8, Jazz lose 128-136. Margin = 128-136 = -8. Is -8 > -8? NO (equal) → PUSH
-   * Example: Jazz +8, Jazz win 140-130. Margin = 140-130 = +10. Is +10 > -8? YES → WIN
+2. Find both teams' final scores
+
+FOR POSITIVE SPREADS (underdog getting points, e.g., "Magic +36.5"):
+- Calculate: How many points did bet team LOSE by? (Opponent score - Bet team score)
+- If bet team WON the game outright → BET WINS
+- If bet team LOST: Compare loss margin to spread number
+  * Loss margin < spread number → WIN (covered the spread)
+  * Loss margin > spread number → LOSS (didn't cover)
+  * Loss margin = spread number → PUSH
+- Examples:
+  * Magic +36.5, score Magic 92 - Thunder 128. Lost by 36. Is 36 < 36.5? YES → WIN
+  * Jazz +8, score Jazz 124 - Suns 140. Lost by 16. Is 16 < 8? NO → LOSS
+  * Pacers +8, score Pacers 100 - Celtics 108. Lost by 8. Is 8 < 8? NO (equal) → PUSH
+  * Bulls +5, score Bulls 110 - Heat 105. Bulls WON outright → WIN
+
+FOR NEGATIVE SPREADS (favorite giving points, e.g., "Warriors -8"):
+- Calculate: How many points did bet team WIN by? (Bet team score - Opponent score)
+- If bet team LOST the game → BET LOSES
+- If bet team WON: Compare win margin to spread number
+  * Win margin > spread number → WIN (covered the spread)
+  * Win margin < spread number → LOSS (didn't cover)
+  * Win margin = spread number → PUSH
+- Examples:
+  * Warriors -8, score Warriors 140 - Jazz 124. Won by 16. Is 16 > 8? YES → WIN
+  * Lakers -6, score Lakers 110 - Kings 108. Won by 2. Is 2 > 6? NO → LOSS
+  * Celtics -10, score Celtics 120 - Nets 110. Won by 10. Is 10 > 10? NO (equal) → PUSH
+  * Bucks -5, score Bucks 98 - Heat 102. Bucks LOST → LOSS
 
 OVER/UNDER - FOLLOW THESE STEPS:
 1. Add both teams' scores: Team1 + Team2 = total
@@ -627,14 +639,19 @@ YOUR TASK:
 2. Re-calculate whether the bet won or lost using these rules:
 
 SPREAD BETS:
-- Calculate margin: (Bet Team's score) - (Opponent's score) = margin (can be negative!)
-- Negative spread (Team -8): Team must win by MORE than 8 → check if margin > 8
-  * Warriors -8, Warriors win 140-124: margin = 140-124 = +16. Is +16 > 8? YES → WIN
-  * Warriors -8, Warriors lose 124-140: margin = 124-140 = -16. Is -16 > 8? NO → LOSS
-  * Warriors -8, Warriors win 132-124: margin = +8. Is +8 > 8? NO (equal) → PUSH
-- Positive spread (Team +8): Team can lose by less than 8 → check if margin > -8
-  * Jazz +8, Jazz lose 124-140: margin = -16. Is -16 > -8? NO → LOSS
-  * Jazz +8, Jazz lose 130-136: margin = -6. Is -6 > -8? YES → WIN
+FOR POSITIVE SPREADS (e.g., "Magic +36.5"):
+- How many points did bet team LOSE by? (Opponent - Bet team)
+- If bet team WON outright → BET WINS
+- If bet team LOST: Is loss margin < spread number? YES → WIN, NO → LOSS, EQUAL → PUSH
+  * Magic +36.5, Magic 92 - Thunder 128. Lost by 36. Is 36 < 36.5? YES → WIN
+  * Jazz +8, Jazz 124 - Suns 140. Lost by 16. Is 16 < 8? NO → LOSS
+
+FOR NEGATIVE SPREADS (e.g., "Warriors -8"):
+- How many points did bet team WIN by? (Bet team - Opponent)
+- If bet team LOST → BET LOSES
+- If bet team WON: Is win margin > spread number? YES → WIN, NO → LOSS, EQUAL → PUSH
+  * Warriors -8, Warriors 140 - Jazz 124. Won by 16. Is 16 > 8? YES → WIN
+  * Lakers -6, Lakers 110 - Kings 108. Won by 2. Is 2 > 6? NO → LOSS
 
 OVER/UNDER:
 - Add both scores: total = score1 + score2

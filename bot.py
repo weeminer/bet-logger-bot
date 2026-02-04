@@ -561,7 +561,15 @@ MONEYLINE (ML): Just check which team won the game
 
 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
 
-If you cannot determine the result from the search, return "Pending"
+PARLAYS: ALL legs must win for the parlay to win. If ANY leg loses, the parlay loses.
+- You MUST verify EVERY leg has data before grading
+- If you cannot find data for ANY leg, return "Pending"
+
+CRITICAL: If you cannot find the specific data needed to grade the bet, return "Pending"
+- Missing player stats? → "Pending"
+- Missing quarter scores? → "Pending"
+- Can't verify a parlay leg? → "Pending"
+- NEVER assume a bet lost just because you can't find the data
 
 CRITICAL INSTRUCTIONS:
 1. Do the math ONCE - do not second-guess yourself
@@ -607,6 +615,17 @@ VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
         # SANITY CHECK: Verify result matches reasoning
         reasoning = parsed.get('reasoning', '').lower()
         result = parsed.get('result', '').lower()
+
+        # Check for missing data - should be Pending, not Win/Loss
+        missing_data_phrases = ['cannot find', 'no data', 'cannot verify', 'not found', 'no .* data',
+                                'missing', 'unavailable', 'incomplete', "can't find", "couldn't find"]
+        has_missing_data = any(phrase in reasoning for phrase in missing_data_phrases)
+
+        if has_missing_data and result in ['win', 'loss']:
+            logger.warning(f"MISSING DATA: Reasoning mentions missing data but result is {result}. Correcting to Pending.")
+            parsed['result'] = 'Pending'
+            parsed['reasoning'] += ' [AUTO-CORRECTED: missing data, cannot grade]'
+            return parsed
 
         # Check for contradictions
         if 'therefore: win' in reasoning or 'yes → win' in reasoning or 'yes, so the bet wins' in reasoning:
@@ -675,6 +694,13 @@ OVER/UNDER:
 - Over wins if total > line, PUSH if equal
 - Under wins if total < line, PUSH if equal
 
+PARLAYS: ALL legs must be verified. If ANY leg data is missing → "Pending"
+
+CRITICAL: If you cannot find the data needed, return "Pending"
+- Missing player stats? → "Pending"
+- Can't verify a parlay leg? → "Pending"
+- NEVER grade as Loss just because data is missing
+
 3. Compare your answer to the initial grade
 4. SHOW YOUR MATH
 5. End with "Therefore: WIN" or "Therefore: LOSS" or "Therefore: PUSH"
@@ -711,6 +737,16 @@ Return JSON:
         # SANITY CHECK: Verify result matches reasoning
         your_math = parsed.get('your_math', '').lower()
         verified_result = parsed.get('verified_result', '').lower()
+
+        # Check for missing data - should be Pending
+        missing_data_phrases = ['cannot find', 'no data', 'cannot verify', 'not found',
+                                'missing', 'unavailable', 'incomplete', "can't find", "couldn't find"]
+        has_missing_data = any(phrase in your_math for phrase in missing_data_phrases)
+
+        if has_missing_data and verified_result in ['win', 'loss']:
+            logger.warning(f"VERIFY MISSING DATA: Math mentions missing data. Correcting to Pending.")
+            parsed['verified_result'] = 'Pending'
+            return parsed
 
         if 'therefore: win' in your_math or 'yes → win' in your_math:
             if verified_result == 'loss':

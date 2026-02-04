@@ -14,6 +14,7 @@ import logging
 import requests
 from datetime import datetime, timedelta
 from io import BytesIO
+from PIL import Image
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -70,6 +71,66 @@ def get_google_credentials():
             creds_dict = json.load(f)
 
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+
+def resize_image_if_needed(image_bytes: bytes, max_size_mb: float = 5.0, max_dimension: int = 2000) -> bytes:
+    """
+    Resize image if it's too large for Claude API.
+
+    Args:
+        image_bytes: Original image bytes
+        max_size_mb: Maximum file size in MB
+        max_dimension: Maximum width or height in pixels
+
+    Returns:
+        Resized image bytes (or original if small enough)
+    """
+    # Check if resize is needed
+    size_mb = len(image_bytes) / (1024 * 1024)
+
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        width, height = img.size
+
+        needs_resize = size_mb > max_size_mb or width > max_dimension or height > max_dimension
+
+        if not needs_resize:
+            return image_bytes
+
+        # Calculate new dimensions maintaining aspect ratio
+        if width > height:
+            if width > max_dimension:
+                new_width = max_dimension
+                new_height = int(height * (max_dimension / width))
+            else:
+                new_width, new_height = width, height
+        else:
+            if height > max_dimension:
+                new_height = max_dimension
+                new_width = int(width * (max_dimension / height))
+            else:
+                new_width, new_height = width, height
+
+        # Resize
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Convert to RGB if necessary (for JPEG)
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+
+        # Save to bytes with good quality
+        output = BytesIO()
+        img.save(output, format='JPEG', quality=85, optimize=True)
+        output.seek(0)
+
+        resized_bytes = output.getvalue()
+        logger.info(f"Resized image from {size_mb:.1f}MB ({width}x{height}) to {len(resized_bytes)/(1024*1024):.1f}MB ({new_width}x{new_height})")
+
+        return resized_bytes
+
+    except Exception as e:
+        logger.error(f"Error resizing image: {e}")
+        return image_bytes  # Return original if resize fails
 
 
 def upload_image_to_imgbb(image_bytes: bytes) -> str:
@@ -203,6 +264,9 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     Returns a LIST of dictionaries, one for each bet slip found in the image.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # Resize image if too large for Claude API
+    image_bytes = resize_image_if_needed(image_bytes)
 
     # Convert image to base64
     base64_image = base64.b64encode(image_bytes).decode("utf-8")

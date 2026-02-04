@@ -81,18 +81,18 @@ def get_google_credentials():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 4.0, max_dimension: int = 1568) -> bytes:
+def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 18.0, max_dimension: int = 4096) -> bytes:
     """
-    Process image for Claude API - convert to JPEG and resize if needed.
-    Claude works best with images under 1568px on the long side.
+    Process image for Claude API - only convert if HEIC or resize if huge.
+    Keeps maximum quality for OCR accuracy.
 
     Args:
         image_bytes: Original image bytes
-        max_size_mb: Maximum file size in MB
+        max_size_mb: Maximum file size in MB (Claude limit is ~20MB)
         max_dimension: Maximum width or height in pixels
 
     Returns:
-        Processed JPEG image bytes
+        Processed image bytes
     """
     size_mb = len(image_bytes) / (1024 * 1024)
     logger.info(f"Processing image: {size_mb:.2f}MB")
@@ -104,37 +104,34 @@ def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 4.0, max_d
         original_format = img.format
         logger.info(f"Image format: {original_format}, size: {width}x{height}")
 
-        # Always convert to RGB JPEG for consistency with Claude
+        # Only process if it's HEIC or too large - otherwise keep original
+        is_heic = original_format in ('HEIF', 'HEIC') or original_format is None
+        is_too_large = size_mb > max_size_mb or width > max_dimension or height > max_dimension
+
+        if not is_heic and not is_too_large:
+            logger.info("Image OK, no processing needed")
+            return image_bytes
+
+        # Convert to RGB if needed
         if img.mode in ('RGBA', 'P', 'LA'):
             img = img.convert('RGB')
         elif img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Check if resize is needed
-        needs_resize = size_mb > max_size_mb or width > max_dimension or height > max_dimension
-
-        if needs_resize:
-            # Calculate new dimensions maintaining aspect ratio
+        # Only resize if truly too large
+        if width > max_dimension or height > max_dimension:
             if width > height:
-                if width > max_dimension:
-                    new_width = max_dimension
-                    new_height = int(height * (max_dimension / width))
-                else:
-                    new_width, new_height = width, height
+                new_width = max_dimension
+                new_height = int(height * (max_dimension / width))
             else:
-                if height > max_dimension:
-                    new_height = max_dimension
-                    new_width = int(width * (max_dimension / height))
-                else:
-                    new_width, new_height = width, height
-
-            # Resize with high quality
+                new_height = max_dimension
+                new_width = int(width * (max_dimension / height))
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
             logger.info(f"Resized from {width}x{height} to {new_width}x{new_height}")
 
-        # Save to JPEG bytes with good quality
+        # Save to JPEG with MAXIMUM quality
         output = BytesIO()
-        img.save(output, format='JPEG', quality=90, optimize=True)
+        img.save(output, format='JPEG', quality=98)
         output.seek(0)
 
         processed_bytes = output.getvalue()
@@ -145,7 +142,6 @@ def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 4.0, max_d
 
     except Exception as e:
         logger.error(f"Error processing image: {e}")
-        # If we can't process, return original and hope for the best
         return image_bytes
 
 
@@ -287,33 +283,41 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     # Convert image to base64
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    # Prompt for structured extraction - MULTIPLE SLIPS INCLUDING PARLAYS
-    extraction_prompt = """Analyze this bet slip image carefully and extract ALL information visible.
+    # Prompt for structured extraction - STRICT NO HALLUCINATION
+    extraction_prompt = """Extract data from the sports betting slips in this image.
 
-IMPORTANT - IMAGE QUALITY TIPS:
-- Look very carefully at numbers - distinguish 0/O, 1/I/l, 5/S, 6/8, etc.
-- For dollar amounts, look for decimal points and commas
-- Team names may be abbreviated (e.g., "LAL" = Lakers, "OKC" = Thunder, "DEN" = Nuggets)
-- If text is blurry, use context clues (e.g., if wager is $500 and odds are -110, payout should be ~$954.55)
-- Common sportsbook formats: odds like "-110", "+150", spreads like "-3.5", totals like "O 224.5"
+**CRITICAL: DO NOT MAKE UP OR GUESS ANY DATA**
+- Only report values you can CLEARLY READ in the image
+- If you cannot read a value clearly, use "" (empty string)
+- WRONG DATA IS WORSE THAN MISSING DATA
+- Do NOT invent plausible-sounding numbers
 
-Return a JSON ARRAY of objects, ONE OBJECT PER BET SLIP (not per leg). Each object should have these fields:
+For EACH bet slip visible, extract ONLY what you can clearly see:
+
 {
-    "betslip_number": "the ticket/slip ID number (usually at very top, e.g., 'Betslip no. 12181097944' or 'Ticket #123456')",
-    "date_placed": "YYYY-MM-DD format, the date the BET WAS PLACED (near ticket/slip number at top)",
-    "match_date": "YYYY-MM-DD format, the date of the GAME/MATCH being bet on",
-    "league": "the league (NFL, NBA, MLB, NHL, NCAAB, NCAAF, UFC, etc.)",
-    "teams_event": "the teams or event (e.g., 'OKC Thunder @ DEN Nuggets')",
-    "selection": "what we bet ON - see format below",
-    "bet_type": "Straight, Parlay, SGP (Same Game Parlay), Teaser, Prop, etc.",
-    "odds": "the TOTAL odds for the bet (e.g., +280, -110)",
-    "wager_amount": "numeric value only (e.g., 1197.22)",
-    "potential_payout": "numeric value only, total payout if bet wins (e.g., 4549.44)",
-    "result": "Win/Loss/Push/Pending",
-    "confidence": "high/medium/low",
-    "raw_text": "brief summary of the slip",
-    "notes": "any issues"
+    "betslip_number": "EXACT ticket/slip number visible at top - leave empty if unreadable",
+    "date_placed": "EXACT date shown on slip in YYYY-MM-DD format - leave empty if unreadable",
+    "match_date": "EXACT game date if shown in YYYY-MM-DD format - leave empty if unreadable",
+    "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL/UFC/Soccer - determine from team names",
+    "teams_event": "EXACT team names as shown (e.g., 'USC Trojans @ UCLA Bruins')",
+    "selection": "EXACT bet selection as shown (e.g., 'USC -7.5' or 'Thunder ML' or 'Over 224.5')",
+    "bet_type": "Spread/Moneyline/Total/Parlay/SGP/Prop",
+    "odds": "EXACT odds as shown (e.g., '+115' or '-110') - leave empty if unreadable",
+    "wager_amount": "EXACT dollar amount wagered - numbers only - leave empty if unreadable",
+    "potential_payout": "EXACT potential payout shown - numbers only - leave empty if unreadable",
+    "result": "Pending",
+    "confidence": "high if clearly readable, low if any values are uncertain",
+    "raw_text": "transcribe key text exactly as shown",
+    "notes": "list any values you couldn't read clearly"
 }
+
+LEAGUE RULES:
+- College teams (USC, UCLA, Duke, Kentucky, etc.) = NCAAB or NCAAF
+- Pro teams (Lakers, Thunder, Chiefs, etc.) = NBA, NFL, etc.
+- NEVER use generic "Basketball" or "Football"
+
+Return a JSON array with one object per bet slip. If you cannot read a slip at all, skip it.
+DO NOT INVENT ANY VALUES. Empty string is better than a guess.
 
 PARLAY / SGP (SAME GAME PARLAY) HANDLING:
 - A parlay is ONE bet with multiple legs - create ONE object for the entire parlay, NOT separate objects per leg

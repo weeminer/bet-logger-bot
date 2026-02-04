@@ -19,6 +19,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 import anthropic
 
 # ============================================================================
@@ -46,9 +48,87 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Google Drive folder ID for storing bet slip images (set this to your folder ID)
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")  # Optional: specific folder for images
+
+
 # ============================================================================
 # GOOGLE SHEETS CONNECTION
 # ============================================================================
+def get_google_credentials():
+    """Get Google credentials for Sheets and Drive."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    if GOOGLE_CREDENTIALS_JSON:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    else:
+        with open("credentials.json", "r") as f:
+            creds_dict = json.load(f)
+
+    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+
+def upload_image_to_drive(image_bytes: bytes, filename: str) -> str:
+    """
+    Upload an image to Google Drive and return a shareable link.
+
+    Args:
+        image_bytes: The raw image bytes
+        filename: Name for the file in Drive
+
+    Returns:
+        A shareable link to the uploaded image, or empty string if upload fails
+    """
+    try:
+        credentials = get_google_credentials()
+        service = build('drive', 'v3', credentials=credentials)
+
+        # Prepare the file metadata
+        file_metadata = {
+            'name': filename,
+            'mimeType': 'image/jpeg'
+        }
+
+        # If a folder ID is specified, put the file in that folder
+        if GOOGLE_DRIVE_FOLDER_ID:
+            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
+
+        # Create media upload object
+        media = MediaIoBaseUpload(
+            BytesIO(image_bytes),
+            mimetype='image/jpeg',
+            resumable=True
+        )
+
+        # Upload the file
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute()
+
+        # Make the file viewable by anyone with the link
+        service.permissions().create(
+            fileId=file['id'],
+            body={
+                'type': 'anyone',
+                'role': 'reader'
+            }
+        ).execute()
+
+        # Return the web view link
+        link = file.get('webViewLink', '')
+        logger.info(f"Uploaded image to Drive: {filename} -> {link}")
+        return link
+
+    except Exception as e:
+        logger.error(f"Error uploading image to Drive: {e}")
+        return ""
+
+
 def get_google_sheet():
     """Connect to Google Sheets and return the worksheet."""
     scopes = [
@@ -86,11 +166,24 @@ def append_bet_to_sheet(bet_data: dict):
     # Commission is owed on ALL bets (win, loss, or push) based on potential payout
     commission_formula = f'=IF(L{next_row}/K{next_row}>=2,K{next_row}*0.01,(L{next_row}-K{next_row})*0.01)'
 
+    # Odds Check formula: Calculate American odds from payout/wager and compare to extracted odds
+    # Decimal odds = Payout / Wager
+    # If decimal >= 2: American = (decimal - 1) * 100 (positive odds)
+    # If decimal < 2: American = -100 / (decimal - 1) (negative odds)
+    # Compare to column J with tolerance of ~5 (for rounding differences)
+    odds_check_formula = f'''=LET(
+        decimal_odds, L{next_row}/K{next_row},
+        calc_american, IF(decimal_odds>=2, (decimal_odds-1)*100, -100/(decimal_odds-1)),
+        extracted, VALUE(SUBSTITUTE(SUBSTITUTE(J{next_row},"+",""),",","")),
+        diff, ABS(calc_american - extracted),
+        IF(diff <= 5, "OK", "CHECK - Calc: "&ROUND(calc_american,0))
+    )'''
+
     # Column order:
     # A: Timestamp, B: Date Placed, C: Trader, D: Bettor, E: Match Date, F: League,
     # G: Teams/Event, H: Selection, I: Bet Type, J: Odds, K: Wager,
     # L: Potential Payout, M: Result, N: Net Result, O: Commission,
-    # P: Status, Q: Raw Text, R: Notes
+    # P: Status, Q: Raw Text, R: Notes, S: Betslip Number, T: Odds Check, U: Image Link
     row = [
         bet_data.get("timestamp", ""),
         bet_data.get("date_placed", ""),
@@ -110,6 +203,9 @@ def append_bet_to_sheet(bet_data: dict):
         bet_data.get("status", ""),
         bet_data.get("raw_text", ""),
         bet_data.get("notes", ""),
+        bet_data.get("betslip_number", ""),  # Column S: Betslip Number
+        odds_check_formula,  # Column T: Odds verification
+        bet_data.get("image_link", ""),  # Column U: Link to saved image
     ]
 
     worksheet.append_row(row, value_input_option="USER_ENTERED")
@@ -134,6 +230,7 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
 
 Return a JSON ARRAY of objects, ONE OBJECT PER BET SLIP (not per leg). Each object should have these fields:
 {
+    "betslip_number": "the ticket/slip ID number (usually at very top, e.g., 'Betslip no. 12181097944' or 'Ticket #123456')",
     "date_placed": "YYYY-MM-DD format, the date the BET WAS PLACED (near ticket/slip number at top)",
     "match_date": "YYYY-MM-DD format, the date of the GAME/MATCH being bet on",
     "league": "the league (NFL, NBA, MLB, NHL, NCAAB, NCAAF, UFC, etc.)",
@@ -761,6 +858,11 @@ async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_
 
         # Process each photo
         for i, photo_bytes in enumerate(pending_photos):
+            # Upload image to Google Drive first
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            image_filename = f"betslip_{bettor_name}_{timestamp_str}_{i+1}.jpg"
+            image_link = upload_image_to_drive(photo_bytes, image_filename)
+
             # Extract data using Claude Vision - returns a LIST of bets per photo
             extracted_bets = extract_bet_data_from_image(photo_bytes)
 
@@ -812,6 +914,8 @@ async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_
                     "status": status,
                     "raw_text": extracted_data.get("raw_text", "")[:500],
                     "notes": extracted_data.get("notes", ""),
+                    "betslip_number": extracted_data.get("betslip_number", ""),
+                    "image_link": image_link,  # Link to uploaded image in Drive
                 }
 
                 # Append to Google Sheet

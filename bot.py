@@ -4,7 +4,7 @@ Bet Slip Telegram Bot
 This bot receives bet slip images via Telegram DM, extracts the data using
 Claude's Vision API, and logs it to a Google Sheet.
 
-Supports multiple photos at once - asks for trader only once for all photos..
+Supports multiple photos at once - asks for trader only once for all photos.
 """
 
 import os
@@ -647,16 +647,22 @@ VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
         reasoning = parsed.get('reasoning', '').lower()
         result = parsed.get('result', '').lower()
 
-        # Check for missing data - only correct if it's clearly stating it can't grade
-        # Be specific to avoid false positives
-        cant_grade_phrases = ['cannot determine', 'unable to grade', 'cannot grade',
-                              'no score found', 'no stats found', 'data not available']
+        # Only check REASONING for missing data (not verification_details which may just note context)
+        # Also, if reasoning has concrete stats like "had 6 assists", data WAS found
+        has_concrete_stats = any(word in reasoning for word in ['had ', 'scored ', 'won by ', 'lost by ', 'total '])
+
+        cant_grade_phrases = [
+            'cannot determine', 'unable to grade', 'cannot grade', 'cannot verify all',
+            'score not found', 'stats not found', 'no stats found', 'no score found',
+            'insufficient data', 'data not available', 'cannot find score'
+        ]
         has_missing_data = any(phrase in reasoning for phrase in cant_grade_phrases)
 
-        if has_missing_data and result in ['win', 'loss']:
+        # Only correct if missing data AND no concrete stats found
+        if has_missing_data and not has_concrete_stats and result in ['win', 'loss']:
             logger.warning(f"MISSING DATA: Reasoning says cannot grade but result is {result}. Correcting to Pending.")
             parsed['result'] = 'Pending'
-            parsed['reasoning'] += ' [AUTO-CORRECTED: cannot grade]'
+            parsed['reasoning'] += ' [AUTO-CORRECTED: missing data → Pending]'
             return parsed
 
         # Check for contradictions

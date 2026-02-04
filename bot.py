@@ -85,7 +85,7 @@ def get_google_credentials():
 def extract_text_with_google_vision(image_bytes: bytes) -> str:
     """
     Use Google Cloud Vision API to extract text from an image.
-    This is pure OCR - no hallucination, just reads what's there.
+    Uses DOCUMENT_TEXT_DETECTION to preserve layout structure.
     """
     try:
         credentials = get_google_credentials()
@@ -94,23 +94,29 @@ def extract_text_with_google_vision(image_bytes: bytes) -> str:
         # Encode image to base64
         image_content = base64.b64encode(image_bytes).decode('utf-8')
 
-        # Call Vision API
+        # Call Vision API with DOCUMENT_TEXT_DETECTION for better structure
         request_body = {
             'requests': [{
                 'image': {'content': image_content},
-                'features': [{'type': 'TEXT_DETECTION'}]
+                'features': [{'type': 'DOCUMENT_TEXT_DETECTION'}]
             }]
         }
 
         response = service.images().annotate(body=request_body).execute()
 
-        # Extract the text
+        # Extract the text with structure
         if 'responses' in response and response['responses']:
+            full_text_annotation = response['responses'][0].get('fullTextAnnotation', {})
+            if full_text_annotation:
+                full_text = full_text_annotation.get('text', '')
+                logger.info(f"Google Vision extracted {len(full_text)} characters")
+                return full_text
+
+            # Fallback to textAnnotations
             annotations = response['responses'][0].get('textAnnotations', [])
             if annotations:
-                # First annotation contains all the text
                 full_text = annotations[0].get('description', '')
-                logger.info(f"Google Vision extracted {len(full_text)} characters")
+                logger.info(f"Google Vision (fallback) extracted {len(full_text)} characters")
                 return full_text
 
         logger.warning("Google Vision returned no text")
@@ -323,37 +329,58 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     # Step 3: Use Claude to parse the extracted text (TEXT ONLY - no image)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    extraction_prompt = f"""Parse this OCR text from sports betting slips and extract structured data.
+    extraction_prompt = f"""Parse this OCR text from sports betting slips. There may be MULTIPLE slips.
 
 OCR TEXT:
 \"\"\"
 {ocr_text}
 \"\"\"
 
-For EACH bet slip in the text, extract:
+STEP 1 - FIND ALL BETSLIP NUMBERS:
+Look for long numbers (11-20 digits) like: 12188711295, 12188710078, 12188756049, etc.
+These are unique identifiers for each bet slip. COUNT how many you find.
+
+STEP 2 - FOR EACH BETSLIP NUMBER, EXTRACT ITS DATA:
+The OCR text may be jumbled, but each betslip has its own:
+- Wager amount (e.g., "$500.00", "$1,000.00")
+- Potential payout (e.g., "$2,100.00", "$935.00")
+- Odds (e.g., "+320", "-115", "-110")
+- Selection - INCLUDE QUARTER/HALF INFO! Examples:
+  * "CHI Bulls +17.5 1H" (1st Half spread)
+  * "CHI Bulls +2.5 2Q" (2nd Quarter spread)
+  * "Over 58.5 1Q" (1st Quarter total)
+  * "DEN Nuggets ML" (full game moneyline)
+  * "Under 209.5" (full game total)
+- Teams (e.g., "DEN Nuggets @ DET Pistons")
+
+STEP 3 - OUTPUT ONE OBJECT PER BETSLIP:
+You MUST output exactly as many objects as there are betslip numbers.
+If you found 4 betslip numbers, output 4 objects.
+
+FORMAT for each:
 {{
-    "betslip_number": "ticket number (long number like 1019866057946907648)",
-    "date_placed": "YYYY-MM-DD format",
-    "match_date": "YYYY-MM-DD if shown",
-    "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL/UFC",
+    "betslip_number": "exact number like 12188711295",
+    "date_placed": "YYYY-MM-DD",
+    "match_date": "YYYY-MM-DD",
+    "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL",
     "teams_event": "Team A @ Team B",
-    "selection": "the pick (e.g., 'USC Moneyline', 'Thunder +10.5', 'Over 224.5')",
-    "bet_type": "Spread/Moneyline/Total/Parlay/SGP/Prop",
-    "odds": "e.g., +115 or -110",
-    "wager_amount": "number only",
-    "potential_payout": "TOTAL payout number only",
+    "selection": "the pick WITH period if not full game (e.g., 'Bulls +17.5 1H', 'Over 58.5 1Q', 'Thunder +2.5 2Q')",
+    "bet_type": "Spread/Moneyline/Total/Parlay/SGP",
+    "odds": "+320 or -115 etc",
+    "wager_amount": "number only like 500",
+    "potential_payout": "number only like 2100",
     "result": "Pending",
     "confidence": "high/medium/low",
-    "raw_text": "key text",
-    "notes": "any issues"
+    "raw_text": "key text for THIS slip",
+    "notes": "issues if any"
 }}
 
-RULES:
-- College teams (USC, UCLA, Duke, etc.) = NCAAB or NCAAF
-- Pro teams (Lakers, Thunder, etc.) = NBA, NFL, etc.
-- Parlays: ONE object with legs combined in selection field separated by " / "
-- Return JSON array only, no other text
-- Only include data clearly present in the OCR text"""
+IMPORTANT:
+- College teams = NCAAB/NCAAF
+- Pro teams (Nuggets, Celtics, etc.) = NBA/NFL
+- DO NOT skip any betslip numbers
+- DO NOT merge data from different slips
+- Return JSON array only"""
 
     # TEXT-ONLY call to Claude - no image, just parsing the OCR text
     response = client.messages.create(

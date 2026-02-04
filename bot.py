@@ -208,7 +208,14 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     # Prompt for structured extraction - MULTIPLE SLIPS INCLUDING PARLAYS
-    extraction_prompt = """Analyze this image and extract information from ALL bet slips visible.
+    extraction_prompt = """Analyze this bet slip image carefully and extract ALL information visible.
+
+IMPORTANT - IMAGE QUALITY TIPS:
+- Look very carefully at numbers - distinguish 0/O, 1/I/l, 5/S, 6/8, etc.
+- For dollar amounts, look for decimal points and commas
+- Team names may be abbreviated (e.g., "LAL" = Lakers, "OKC" = Thunder, "DEN" = Nuggets)
+- If text is blurry, use context clues (e.g., if wager is $500 and odds are -110, payout should be ~$954.55)
+- Common sportsbook formats: odds like "-110", "+150", spreads like "-3.5", totals like "O 224.5"
 
 Return a JSON ARRAY of objects, ONE OBJECT PER BET SLIP (not per leg). Each object should have these fields:
 {
@@ -667,6 +674,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. I'll process them all and log to the spreadsheet\n\n"
         "Commands:\n"
         "/grade - Grade all pending bets\n\n"
+        "📌 FOR BETTER QUALITY:\n"
+        "Send images as FILES instead of photos!\n"
+        "• iOS: Tap 📎 → File → select image\n"
+        "• Android: Tap 📎 → File → Gallery\n"
+        "This prevents Telegram compression.\n\n"
         "Tips:\n"
         "• Good lighting helps accuracy\n"
         "• Avoid blurry photos\n"
@@ -779,8 +791,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get bettor name from mapping, or use Telegram name
     bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
 
-    # Download the photo
-    photo = update.message.photo[-1]
+    # Download the photo - get the largest available size
+    photo = update.message.photo[-1]  # -1 is largest
     photo_file = await photo.get_file()
     photo_bytes = BytesIO()
     await photo_file.download_to_memory(photo_bytes)
@@ -812,6 +824,58 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
     # Additional photos are silently added - no response needed
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming documents/files (for uncompressed images)."""
+    user = update.effective_user
+    username = user.username or str(user.id)
+
+    # Get bettor name from mapping, or use Telegram name
+    bettor_name = BETTOR_NAMES.get(username, user.first_name or username)
+
+    # Check if it's an image file
+    document = update.message.document
+    mime_type = document.mime_type or ""
+
+    if not mime_type.startswith("image/"):
+        await update.message.reply_text(
+            "Please send image files only (jpg, png, etc.)"
+        )
+        return
+
+    # Download the file (uncompressed)
+    doc_file = await document.get_file()
+    file_bytes = BytesIO()
+    await doc_file.download_to_memory(file_bytes)
+    file_bytes.seek(0)
+
+    # Initialize pending_photos list if not exists
+    if 'pending_photos' not in context.user_data:
+        context.user_data['pending_photos'] = []
+
+    # Check if this is the first photo (need to ask for trader)
+    is_first_photo = len(context.user_data['pending_photos']) == 0
+
+    # Add this photo to the pending list
+    context.user_data['pending_photos'].append(file_bytes.getvalue())
+    context.user_data['bettor_name'] = bettor_name
+
+    if is_first_photo:
+        # First photo - ask for trader
+        keyboard = [
+            [
+                InlineKeyboardButton("Will", callback_data="trader_Will"),
+                InlineKeyboardButton("Serge", callback_data="trader_Serge"),
+                InlineKeyboardButton("PYR", callback_data="trader_PYR"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "📸 Got it! (File received - better quality) Who was the trader?",
+            reply_markup=reply_markup
+        )
+    # Additional files are silently added - no response needed
 
 
 async def handle_trader_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -967,6 +1031,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("grade", grade_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))  # Handle image files
     application.add_handler(CallbackQueryHandler(handle_trader_selection, pattern="^trader_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

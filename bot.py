@@ -563,7 +563,11 @@ MONEYLINE (ML): Just check which team won the game
 
 If you cannot determine the result from the search, return "Pending"
 
-IMPORTANT: ALWAYS show your math step-by-step in the reasoning field!
+CRITICAL INSTRUCTIONS:
+1. Do the math ONCE - do not second-guess yourself
+2. Write your conclusion clearly: "Therefore: WIN" or "Therefore: LOSS" or "Therefore: PUSH"
+3. The "result" field MUST match your conclusion - if your math shows WIN, result MUST be "Win"
+4. NEVER put "Loss" in result if your calculation showed the bet won
 
 Return ONLY a JSON object:
 {{
@@ -574,17 +578,12 @@ Return ONLY a JSON object:
     "verification_details": "Specific score/stats for this bet type - see examples below"
 }}
 
-VERIFICATION_DETAILS EXAMPLES (be specific to the bet type):
-- 1Q Total bet: "1Q: PHI 31 - GSW 32, Total: 63"
-- 1H Spread bet: "1H: CHI 45 - MIL 58, Margin: -13"
-- Full game Total: "Final: LAL 110 - BOS 105, Total: 215"
-- Full game Spread: "Final: UTA 98 - IND 112, Margin: -14"
-- Moneyline: "Final: DEN 118 - DET 105, DEN wins"
-- Player prop (points): "Ace Bailey: 18 pts (line was O15.5)"
-- Player prop (3PM): "Jay Huff: 2 3PM (line was U2.5)"
-- Parlay with props: "Ace Bailey: 18 pts | Jay Huff: 2 3PM"
-
-The verification_details should be a SHORT summary that lets someone quickly verify the grade."""
+VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
+- Spread: "MIL 131-115, won by 16" or "ORL 92-128, lost by 36"
+- Total: "236 total (115+121)"
+- 1Q/1H: "1Q: 31-32, total 63" or "1H: 58-45, margin 13"
+- ML: "MIL 131-115"
+- Player prop: "Bailey 18 pts" or "Huff 2 3PM""""
 
     try:
         response = client.messages.create(
@@ -603,7 +602,25 @@ The verification_details should be a SHORT summary that lets someone quickly ver
         else:
             json_str = response_text
 
-        return json.loads(json_str.strip())
+        parsed = json.loads(json_str.strip())
+
+        # SANITY CHECK: Verify result matches reasoning
+        reasoning = parsed.get('reasoning', '').lower()
+        result = parsed.get('result', '').lower()
+
+        # Check for contradictions
+        if 'therefore: win' in reasoning or 'yes → win' in reasoning or 'yes, so the bet wins' in reasoning:
+            if result == 'loss':
+                logger.warning(f"CONTRADICTION: Reasoning says WIN but result says Loss. Correcting to Win.")
+                parsed['result'] = 'Win'
+                parsed['reasoning'] += ' [AUTO-CORRECTED: reasoning said WIN]'
+        elif 'therefore: loss' in reasoning or 'no → loss' in reasoning or 'the bet loses' in reasoning:
+            if result == 'win':
+                logger.warning(f"CONTRADICTION: Reasoning says LOSS but result says Win. Correcting to Loss.")
+                parsed['result'] = 'Loss'
+                parsed['reasoning'] += ' [AUTO-CORRECTED: reasoning said LOSS]'
+
+        return parsed
 
     except Exception as e:
         logger.error(f"Error grading bet with Claude: {e}")
@@ -660,6 +677,8 @@ OVER/UNDER:
 
 3. Compare your answer to the initial grade
 4. SHOW YOUR MATH
+5. End with "Therefore: WIN" or "Therefore: LOSS" or "Therefore: PUSH"
+6. The "verified_result" field MUST match your conclusion
 
 Return JSON:
 {{
@@ -668,7 +687,7 @@ Return JSON:
     "your_math": "show your calculation",
     "agrees_with_initial": true or false,
     "confidence": "high" or "medium" or "low",
-    "verification_details": "Specific score/stats (e.g., '1Q: PHI 31 - GSW 32, Total: 63' or 'Ace Bailey: 18 pts')"
+    "verification_details": "SHORT - just the key numbers (e.g., 'MIL 131-115, won by 16' or '236 total')"
 }}"""
 
     try:
@@ -687,7 +706,29 @@ Return JSON:
         else:
             json_str = response_text
 
-        return json.loads(json_str.strip())
+        parsed = json.loads(json_str.strip())
+
+        # SANITY CHECK: Verify result matches reasoning
+        your_math = parsed.get('your_math', '').lower()
+        verified_result = parsed.get('verified_result', '').lower()
+
+        if 'therefore: win' in your_math or 'yes → win' in your_math:
+            if verified_result == 'loss':
+                logger.warning(f"VERIFY CONTRADICTION: Math says WIN but result says Loss. Correcting.")
+                parsed['verified_result'] = 'Win'
+        elif 'therefore: loss' in your_math or 'no → loss' in your_math:
+            if verified_result == 'win':
+                logger.warning(f"VERIFY CONTRADICTION: Math says LOSS but result says Win. Correcting.")
+                parsed['verified_result'] = 'Loss'
+
+        # Also check if agrees_with_initial is correct
+        initial_result = initial_grade.get('result', '').lower()
+        if parsed.get('verified_result', '').lower() != initial_result:
+            parsed['agrees_with_initial'] = False
+        else:
+            parsed['agrees_with_initial'] = True
+
+        return parsed
 
     except Exception as e:
         logger.error(f"Verification error: {e}")

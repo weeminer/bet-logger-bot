@@ -57,6 +57,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global flag to stop grading
+grading_in_progress = False
+stop_grading = False
 
 # Google Drive folder ID for storing bet slip images (set this to your folder ID)
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")  # Optional: specific folder for images
@@ -617,7 +620,7 @@ VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
         result = parsed.get('result', '').lower()
 
         # Check for missing data - should be Pending, not Win/Loss
-        missing_data_phrases = ['cannot find', 'no data', 'cannot verify', 'not found', 'no .* data',
+        missing_data_phrases = ['cannot find', 'no data', 'cannot verify', 'not found',
                                 'missing', 'unavailable', 'incomplete', "can't find", "couldn't find"]
         has_missing_data = any(phrase in reasoning for phrase in missing_data_phrases)
 
@@ -848,6 +851,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Show this message\n"
         "/status - Check if I'm connected properly\n"
         "/grade - Grade all pending bets\n"
+        "/stop - Stop grading in progress\n"
         "/help - Get help with sending bet slips"
     )
 
@@ -902,8 +906,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /stop command - stop grading in progress."""
+    global stop_grading, grading_in_progress
+
+    if grading_in_progress:
+        stop_grading = True
+        await update.message.reply_text("🛑 Stopping grading... will finish current bet then stop.")
+    else:
+        await update.message.reply_text("ℹ️ No grading in progress.")
+
+
 async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /grade command - grade all pending bets."""
+    global grading_in_progress, stop_grading
+
+    if grading_in_progress:
+        await update.message.reply_text("⚠️ Grading already in progress. Use /stop to cancel.")
+        return
+
     await update.message.reply_text("🔍 Fetching pending bets...")
 
     try:
@@ -914,16 +935,26 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ No pending bets to grade!")
             return
 
+        grading_in_progress = True
+        stop_grading = False
+
         await update.message.reply_text(
             f"📊 Found {len(pending_bets)} pending bet(s). Grading now...\n"
-            "Searching for game results..."
+            "Searching for game results...\n"
+            "💡 Use /stop to cancel"
         )
 
         graded = []
         errors = []
         not_found = []
+        stopped = False
 
         for bet in pending_bets:
+            # Check if stop was requested
+            if stop_grading:
+                stopped = True
+                break
+
             try:
                 # Grade the bet using The Odds API
                 grade_result = grade_bet(bet)
@@ -956,6 +987,9 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error grading bet {bet['selection']}: {e}")
 
         # Send summary
+        if stopped:
+            await update.message.reply_text(f"🛑 Grading stopped. Graded {len(graded)} bet(s) before stopping.")
+
         if graded:
             summary_lines = []
             for g in graded[:20]:
@@ -976,7 +1010,7 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Wins: {wins} | Losses: {losses} | Pushes: {pushes}\n\n"
                 f"{summary}"
             )
-        else:
+        elif not stopped:
             await update.message.reply_text(
                 "ℹ️ No bets were graded.\n"
                 "Either games haven't been played yet, or results couldn't be found."
@@ -998,6 +1032,11 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in grade command: {e}")
         await update.message.reply_text(f"❌ Error grading bets: {str(e)[:100]}")
+
+    finally:
+        # Reset flags
+        grading_in_progress = False
+        stop_grading = False
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1247,6 +1286,7 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("grade", grade_command))
+    application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))  # Handle image files
     application.add_handler(CallbackQueryHandler(handle_trader_selection, pattern="^trader_"))

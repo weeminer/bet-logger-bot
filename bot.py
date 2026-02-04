@@ -16,6 +16,14 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image
 
+# Try to import HEIC support (for iPhone photos sent as files)
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIC_SUPPORTED = True
+except ImportError:
+    HEIC_SUPPORTED = False
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import gspread
@@ -73,9 +81,10 @@ def get_google_credentials():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def resize_image_if_needed(image_bytes: bytes, max_size_mb: float = 5.0, max_dimension: int = 2000) -> bytes:
+def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 4.0, max_dimension: int = 1568) -> bytes:
     """
-    Resize image if it's too large for Claude API.
+    Process image for Claude API - convert to JPEG and resize if needed.
+    Claude works best with images under 1568px on the long side.
 
     Args:
         image_bytes: Original image bytes
@@ -83,54 +92,61 @@ def resize_image_if_needed(image_bytes: bytes, max_size_mb: float = 5.0, max_dim
         max_dimension: Maximum width or height in pixels
 
     Returns:
-        Resized image bytes (or original if small enough)
+        Processed JPEG image bytes
     """
-    # Check if resize is needed
     size_mb = len(image_bytes) / (1024 * 1024)
+    logger.info(f"Processing image: {size_mb:.2f}MB")
 
     try:
+        # Try to open with PIL
         img = Image.open(BytesIO(image_bytes))
         width, height = img.size
+        original_format = img.format
+        logger.info(f"Image format: {original_format}, size: {width}x{height}")
 
-        needs_resize = size_mb > max_size_mb or width > max_dimension or height > max_dimension
-
-        if not needs_resize:
-            return image_bytes
-
-        # Calculate new dimensions maintaining aspect ratio
-        if width > height:
-            if width > max_dimension:
-                new_width = max_dimension
-                new_height = int(height * (max_dimension / width))
-            else:
-                new_width, new_height = width, height
-        else:
-            if height > max_dimension:
-                new_height = max_dimension
-                new_width = int(width * (max_dimension / height))
-            else:
-                new_width, new_height = width, height
-
-        # Resize
-        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Convert to RGB if necessary (for JPEG)
-        if img.mode in ('RGBA', 'P'):
+        # Always convert to RGB JPEG for consistency with Claude
+        if img.mode in ('RGBA', 'P', 'LA'):
+            img = img.convert('RGB')
+        elif img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Save to bytes with good quality
+        # Check if resize is needed
+        needs_resize = size_mb > max_size_mb or width > max_dimension or height > max_dimension
+
+        if needs_resize:
+            # Calculate new dimensions maintaining aspect ratio
+            if width > height:
+                if width > max_dimension:
+                    new_width = max_dimension
+                    new_height = int(height * (max_dimension / width))
+                else:
+                    new_width, new_height = width, height
+            else:
+                if height > max_dimension:
+                    new_height = max_dimension
+                    new_width = int(width * (max_dimension / height))
+                else:
+                    new_width, new_height = width, height
+
+            # Resize with high quality
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            logger.info(f"Resized from {width}x{height} to {new_width}x{new_height}")
+
+        # Save to JPEG bytes with good quality
         output = BytesIO()
-        img.save(output, format='JPEG', quality=85, optimize=True)
+        img.save(output, format='JPEG', quality=90, optimize=True)
         output.seek(0)
 
-        resized_bytes = output.getvalue()
-        logger.info(f"Resized image from {size_mb:.1f}MB ({width}x{height}) to {len(resized_bytes)/(1024*1024):.1f}MB ({new_width}x{new_height})")
+        processed_bytes = output.getvalue()
+        new_size_mb = len(processed_bytes) / (1024 * 1024)
+        logger.info(f"Processed image: {new_size_mb:.2f}MB")
 
-        return resized_bytes
+        return processed_bytes
 
     except Exception as e:
-        logger.error(f"Error resizing image: {e}")
-        return image_bytes  # Return original if resize fails
+        logger.error(f"Error processing image: {e}")
+        # If we can't process, return original and hope for the best
+        return image_bytes
 
 
 def upload_image_to_imgbb(image_bytes: bytes) -> str:
@@ -265,8 +281,8 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Resize image if too large for Claude API
-    image_bytes = resize_image_if_needed(image_bytes)
+    # Process image - convert to JPEG and resize if needed
+    image_bytes = process_image_for_claude(image_bytes)
 
     # Convert image to base64
     base64_image = base64.b64encode(image_bytes).decode("utf-8")

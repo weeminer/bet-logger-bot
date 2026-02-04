@@ -4,7 +4,7 @@ Bet Slip Telegram Bot
 This bot receives bet slip images via Telegram DM, extracts the data using
 Claude's Vision API, and logs it to a Google Sheet.
 
-Supports multiple photos at once - asks for trader only once for all photos..
+Supports multiple photos at once - asks for trader only once for all photos.
 """
 
 import os
@@ -12,6 +12,7 @@ import json
 import base64
 import logging
 import requests
+import asyncio
 from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image
@@ -950,6 +951,9 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stopped = False
 
         for bet in pending_bets:
+            # Allow other handlers (like /stop) to process
+            await asyncio.sleep(0)
+
             # Check if stop was requested
             if stop_grading:
                 stopped = True

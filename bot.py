@@ -459,19 +459,38 @@ def get_pending_bets():
 
 def search_game_result(bet: dict) -> str:
     """Search for game result using Tavily API."""
-    # Build search query from bet info
     match_date = bet['match_date']
     league = bet['league']
     teams = bet['teams_event']
     selection = bet['selection']
+    bet_type = bet.get('bet_type', '').lower()
 
-    # Check if it's a quarter/half bet
+    # Parse date to more natural format (Feb 3 2026)
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(match_date, "%Y-%m-%d")
+        date_str = dt.strftime("%B %d %Y")  # "February 03 2026"
+    except:
+        date_str = match_date
+
+    # Clean up team names (remove @ symbol, abbreviations)
+    teams_clean = teams.replace("@", "vs").replace("  ", " ")
+
+    # Check bet type to customize search
     is_partial = any(x in selection.lower() for x in ['1q', '2q', '3q', '4q', '1h', '2h', 'first quarter', 'first half', 'second half'])
+    is_player_prop = 'parlay' in bet_type or 'over' in selection.lower() or 'under' in selection.lower()
 
-    if is_partial:
-        query = f"{teams} {league} {match_date} box score quarter by quarter"
+    # Check if it's a player prop (has a player name pattern)
+    player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks']
+    has_player_stat = any(kw in selection.lower() for kw in player_keywords)
+
+    if has_player_stat:
+        # Extract potential player name from selection (first 2-3 words often)
+        query = f"{selection.split('Over')[0].split('Under')[0].strip()} stats {date_str} {league}"
+    elif is_partial:
+        query = f"{teams_clean} {date_str} box score quarter scores"
     else:
-        query = f"{teams} {league} {match_date} final score result"
+        query = f"{teams_clean} {date_str} final score"
 
     logger.info(f"Searching Tavily for: {query}")
 
@@ -565,21 +584,29 @@ MONEYLINE (ML): Just check which team won the game
 
 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
 
-PARLAYS: ALL legs must win for the parlay to win. If ANY leg loses, the parlay loses.
-- You MUST verify EVERY leg has data before grading
-- If you cannot find data for ANY leg, return "Pending"
+PARLAYS: ALL legs must win. If ANY leg loses, the parlay loses.
+- If you can't verify ALL legs, return "Pending"
 
-CRITICAL: If you cannot find the specific data needed to grade the bet, return "Pending"
-- Missing player stats? → "Pending"
-- Missing quarter scores? → "Pending"
-- Can't verify a parlay leg? → "Pending"
-- NEVER assume a bet lost just because you can't find the data
+PLAYER PROPS: Look for individual player stats in the search results.
+- If player stats not found, return "Pending"
 
-CRITICAL INSTRUCTIONS:
-1. Do the math ONCE - do not second-guess yourself
-2. Write your conclusion clearly: "Therefore: WIN" or "Therefore: LOSS" or "Therefore: PUSH"
-3. The "result" field MUST match your conclusion - if your math shows WIN, result MUST be "Win"
-4. NEVER put "Loss" in result if your calculation showed the bet won
+1Q/1H BETS: Need quarter-by-quarter or half scores.
+- If quarter/half scores not found, return "Pending"
+
+WHEN TO RETURN "Pending":
+- Score not found in search results
+- Player stats not found for player props
+- Quarter/half scores not found for partial game bets
+- Can't verify all parlay legs
+- Any uncertainty about the data
+
+WHEN IN DOUBT, RETURN "Pending" - a wrong grade is worse than no grade.
+
+INSTRUCTIONS:
+1. Find the EXACT score in the search results
+2. If score found, do the math ONCE and return Win/Loss/Push
+3. If score NOT found or uncertain, return "Pending"
+4. ALWAYS include whatever score info you found in verification_details
 
 Return ONLY a JSON object:
 {{
@@ -620,15 +647,16 @@ VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
         reasoning = parsed.get('reasoning', '').lower()
         result = parsed.get('result', '').lower()
 
-        # Check for missing data - should be Pending, not Win/Loss
-        missing_data_phrases = ['cannot find', 'no data', 'cannot verify', 'not found',
-                                'missing', 'unavailable', 'incomplete', "can't find", "couldn't find"]
-        has_missing_data = any(phrase in reasoning for phrase in missing_data_phrases)
+        # Check for missing data - only correct if it's clearly stating it can't grade
+        # Be specific to avoid false positives
+        cant_grade_phrases = ['cannot determine', 'unable to grade', 'cannot grade',
+                              'no score found', 'no stats found', 'data not available']
+        has_missing_data = any(phrase in reasoning for phrase in cant_grade_phrases)
 
         if has_missing_data and result in ['win', 'loss']:
-            logger.warning(f"MISSING DATA: Reasoning mentions missing data but result is {result}. Correcting to Pending.")
+            logger.warning(f"MISSING DATA: Reasoning says cannot grade but result is {result}. Correcting to Pending.")
             parsed['result'] = 'Pending'
-            parsed['reasoning'] += ' [AUTO-CORRECTED: missing data, cannot grade]'
+            parsed['reasoning'] += ' [AUTO-CORRECTED: cannot grade]'
             return parsed
 
         # Check for contradictions
@@ -776,7 +804,7 @@ Return JSON:
 
 
 def grade_bet(bet: dict) -> dict:
-    """Main function to grade a single bet using Tavily search with verification."""
+    """Main function to grade a single bet using Tavily search."""
     # Search for the game result
     search_results = search_game_result(bet)
 
@@ -785,38 +813,14 @@ def grade_bet(bet: dict) -> dict:
             "result": "Pending",
             "confidence": "low",
             "final_score": "",
-            "reasoning": "Could not find game results"
+            "reasoning": "Could not find game results",
+            "verification_details": ""
         }
 
-    # Initial grading
-    initial_grade = grade_bet_with_search(bet, search_results)
+    # Grade the bet (single pass - no verification step to avoid second-guessing)
+    grade_result = grade_bet_with_search(bet, search_results)
 
-    # Skip verification for pending results
-    if initial_grade.get('result', '').lower() == 'pending':
-        return initial_grade
-
-    # Verification step
-    verification = verify_grade(bet, initial_grade, search_results)
-
-    # If verification agrees, use the initial grade
-    if verification.get('agrees_with_initial', False):
-        initial_grade['confidence'] = 'high'
-        initial_grade['reasoning'] += f" [VERIFIED: {verification.get('your_math', '')}]"
-        # Use verification_details from verification if available, otherwise from initial grade
-        if verification.get('verification_details'):
-            initial_grade['verification_details'] = verification.get('verification_details')
-        return initial_grade
-
-    # If verification disagrees, use the verified result but flag it
-    logger.warning(f"Grade verification mismatch for {bet['selection']}: initial={initial_grade.get('result')}, verified={verification.get('verified_result')}")
-
-    return {
-        "result": verification.get('verified_result', 'Pending'),
-        "final_score": verification.get('actual_score', initial_grade.get('final_score', '')),
-        "reasoning": f"CORRECTED: {verification.get('your_math', '')}",
-        "confidence": verification.get('confidence', 'medium'),
-        "verification_details": verification.get('verification_details', initial_grade.get('verification_details', ''))
-    }
+    return grade_result
 
 
 def update_bet_result(row_num: int, result: str, notes: str, verification_details: str = ""):
@@ -965,9 +969,18 @@ async def grade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 result = grade_result.get("result", "Pending")
 
-                # Track games that couldn't be found
+                # Track games that couldn't be found or graded
                 if result.lower() == "pending":
                     reason = grade_result.get('reasoning', '')
+                    final_score = grade_result.get('final_score', '')
+                    verification = grade_result.get('verification_details', '')
+
+                    # Still write score to column V for manual review
+                    if final_score or verification:
+                        score_info = verification if verification else final_score
+                        worksheet = get_google_sheet()
+                        worksheet.update_cell(bet['row_num'], 22, f"[PENDING] {score_info}")
+
                     if 'not found' in reason.lower() or 'unknown league' in reason.lower():
                         not_found.append(f"• {bet['teams_event'][:30]} ({bet['league']})")
                     continue

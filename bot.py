@@ -594,7 +594,7 @@ VERIFICATION_DETAILS - Keep it SHORT, just the numbers:
 - Total: "236 total (115+121)"
 - 1Q/1H: "1Q: 31-32, total 63" or "1H: 58-45, margin 13"
 - ML: "MIL 131-115"
-- Player prop: "Bailey 18 pts" or "Huff 2 3PM""""
+- Player prop: "Bailey 18 pts" or "Huff 2 3PM\""""
 
     try:
         response = client.messages.create(

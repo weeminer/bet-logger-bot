@@ -4,3 +4,4 @@ google-auth
 google-api-python-client
 anthropic
 requests
+Pillow

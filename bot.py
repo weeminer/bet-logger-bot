@@ -81,44 +81,71 @@ def get_google_credentials():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 18.0, max_dimension: int = 4096) -> bytes:
+def extract_text_with_google_vision(image_bytes: bytes) -> str:
     """
-    Process image for Claude API - only convert if HEIC or resize if huge.
-    Keeps maximum quality for OCR accuracy.
+    Use Google Cloud Vision API to extract text from an image.
+    This is pure OCR - no hallucination, just reads what's there.
+    """
+    try:
+        credentials = get_google_credentials()
+        service = build('vision', 'v1', credentials=credentials)
+
+        # Encode image to base64
+        image_content = base64.b64encode(image_bytes).decode('utf-8')
+
+        # Call Vision API
+        request_body = {
+            'requests': [{
+                'image': {'content': image_content},
+                'features': [{'type': 'TEXT_DETECTION'}]
+            }]
+        }
+
+        response = service.images().annotate(body=request_body).execute()
+
+        # Extract the text
+        if 'responses' in response and response['responses']:
+            annotations = response['responses'][0].get('textAnnotations', [])
+            if annotations:
+                # First annotation contains all the text
+                full_text = annotations[0].get('description', '')
+                logger.info(f"Google Vision extracted {len(full_text)} characters")
+                return full_text
+
+        logger.warning("Google Vision returned no text")
+        return ""
+
+    except Exception as e:
+        logger.error(f"Google Vision OCR error: {e}")
+        return ""
+
+
+def process_image_for_claude(image_bytes: bytes, max_dimension: int = 2000) -> bytes:
+    """
+    Process image for Claude API - convert to JPEG and resize for reliable OCR.
 
     Args:
         image_bytes: Original image bytes
-        max_size_mb: Maximum file size in MB (Claude limit is ~20MB)
         max_dimension: Maximum width or height in pixels
 
     Returns:
-        Processed image bytes
+        Processed JPEG image bytes
     """
     size_mb = len(image_bytes) / (1024 * 1024)
     logger.info(f"Processing image: {size_mb:.2f}MB")
 
     try:
-        # Try to open with PIL
+        # Open with PIL
         img = Image.open(BytesIO(image_bytes))
         width, height = img.size
         original_format = img.format
         logger.info(f"Image format: {original_format}, size: {width}x{height}")
 
-        # Only process if it's HEIC or too large - otherwise keep original
-        is_heic = original_format in ('HEIF', 'HEIC') or original_format is None
-        is_too_large = size_mb > max_size_mb or width > max_dimension or height > max_dimension
-
-        if not is_heic and not is_too_large:
-            logger.info("Image OK, no processing needed")
-            return image_bytes
-
         # Convert to RGB if needed
-        if img.mode in ('RGBA', 'P', 'LA'):
-            img = img.convert('RGB')
-        elif img.mode != 'RGB':
+        if img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Only resize if truly too large
+        # Resize if larger than max dimension
         if width > max_dimension or height > max_dimension:
             if width > height:
                 new_width = max_dimension
@@ -129,9 +156,9 @@ def process_image_for_claude(image_bytes: bytes, max_size_mb: float = 18.0, max_
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
             logger.info(f"Resized from {width}x{height} to {new_width}x{new_height}")
 
-        # Save to JPEG with MAXIMUM quality
+        # Save to JPEG
         output = BytesIO()
-        img.save(output, format='JPEG', quality=98)
+        img.save(output, format='JPEG', quality=95)
         output.seek(0)
 
         processed_bytes = output.getvalue()
@@ -268,108 +295,73 @@ def append_bet_to_sheet(bet_data: dict):
 
 
 # ============================================================================
-# CLAUDE VISION - BET SLIP EXTRACTION (MULTI-SLIP SUPPORT)
+# BET SLIP EXTRACTION - Google Vision OCR + Claude Parsing
 # ============================================================================
 def extract_bet_data_from_image(image_bytes: bytes) -> list:
     """
-    Send the bet slip image to Claude's Vision API and extract structured data.
-    Returns a LIST of dictionaries, one for each bet slip found in the image.
+    Extract bet data using two-step process:
+    1. Google Cloud Vision extracts the raw text (pure OCR, no hallucination)
+    2. Claude parses the text into structured data (text only, no vision)
     """
+    # Step 1: Process image for Google Vision
+    processed_image = process_image_for_claude(image_bytes)
+
+    # Step 2: Extract text using Google Cloud Vision
+    ocr_text = extract_text_with_google_vision(processed_image)
+
+    if not ocr_text:
+        logger.error("Google Vision returned no text - cannot process image")
+        return [{
+            "confidence": "low",
+            "notes": "Could not extract text from image",
+            "result": "Pending"
+        }]
+
+    logger.info(f"OCR Text extracted ({len(ocr_text)} chars):\n{ocr_text[:500]}...")
+
+    # Step 3: Use Claude to parse the extracted text (TEXT ONLY - no image)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Process image - convert to JPEG and resize if needed
-    image_bytes = process_image_for_claude(image_bytes)
+    extraction_prompt = f"""Parse this OCR text from sports betting slips and extract structured data.
 
-    # Convert image to base64
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+OCR TEXT:
+\"\"\"
+{ocr_text}
+\"\"\"
 
-    # Prompt for structured extraction - STRICT NO HALLUCINATION
-    extraction_prompt = """Extract data from the sports betting slips in this image.
-
-**CRITICAL: DO NOT MAKE UP OR GUESS ANY DATA**
-- Only report values you can CLEARLY READ in the image
-- If you cannot read a value clearly, use "" (empty string)
-- WRONG DATA IS WORSE THAN MISSING DATA
-- Do NOT invent plausible-sounding numbers
-
-For EACH bet slip visible, extract ONLY what you can clearly see:
-
-{
-    "betslip_number": "EXACT ticket/slip number visible at top - leave empty if unreadable",
-    "date_placed": "EXACT date shown on slip in YYYY-MM-DD format - leave empty if unreadable",
-    "match_date": "EXACT game date if shown in YYYY-MM-DD format - leave empty if unreadable",
-    "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL/UFC/Soccer - determine from team names",
-    "teams_event": "EXACT team names as shown (e.g., 'USC Trojans @ UCLA Bruins')",
-    "selection": "EXACT bet selection as shown (e.g., 'USC -7.5' or 'Thunder ML' or 'Over 224.5')",
+For EACH bet slip in the text, extract:
+{{
+    "betslip_number": "ticket number (long number like 1019866057946907648)",
+    "date_placed": "YYYY-MM-DD format",
+    "match_date": "YYYY-MM-DD if shown",
+    "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL/UFC",
+    "teams_event": "Team A @ Team B",
+    "selection": "the pick (e.g., 'USC Moneyline', 'Thunder +10.5', 'Over 224.5')",
     "bet_type": "Spread/Moneyline/Total/Parlay/SGP/Prop",
-    "odds": "EXACT odds as shown (e.g., '+115' or '-110') - leave empty if unreadable",
-    "wager_amount": "EXACT dollar amount wagered - numbers only - leave empty if unreadable",
-    "potential_payout": "EXACT potential payout shown - numbers only - leave empty if unreadable",
+    "odds": "e.g., +115 or -110",
+    "wager_amount": "number only",
+    "potential_payout": "TOTAL payout number only",
     "result": "Pending",
-    "confidence": "high if clearly readable, low if any values are uncertain",
-    "raw_text": "transcribe key text exactly as shown",
-    "notes": "list any values you couldn't read clearly"
-}
+    "confidence": "high/medium/low",
+    "raw_text": "key text",
+    "notes": "any issues"
+}}
 
-LEAGUE RULES:
-- College teams (USC, UCLA, Duke, Kentucky, etc.) = NCAAB or NCAAF
-- Pro teams (Lakers, Thunder, Chiefs, etc.) = NBA, NFL, etc.
-- NEVER use generic "Basketball" or "Football"
+RULES:
+- College teams (USC, UCLA, Duke, etc.) = NCAAB or NCAAF
+- Pro teams (Lakers, Thunder, etc.) = NBA, NFL, etc.
+- Parlays: ONE object with legs combined in selection field separated by " / "
+- Return JSON array only, no other text
+- Only include data clearly present in the OCR text"""
 
-Return a JSON array with one object per bet slip. If you cannot read a slip at all, skip it.
-DO NOT INVENT ANY VALUES. Empty string is better than a guess.
-
-PARLAY / SGP (SAME GAME PARLAY) HANDLING:
-- A parlay is ONE bet with multiple legs - create ONE object for the entire parlay, NOT separate objects per leg
-- Look for "Parlay (X Picks)" to identify parlays
-- For the "selection" field, combine ALL legs separated by " / "
-- Example SGP with 2 legs:
-  {
-    "teams_event": "OKC Thunder @ DEN Nuggets",
-    "selection": "Shai Gilgeous-Alexander U29.5 pts / Chet Holmgren U1.5 3pt",
-    "bet_type": "SGP",
-    "odds": "+280",
-    "wager_amount": "1197.22",
-    "potential_payout": "4549.44"
-  }
-
-STRAIGHT BET EXAMPLE:
-  {
-    "teams_event": "Lakers @ Celtics",
-    "selection": "Lakers -3.5",
-    "bet_type": "Spread",
-    "odds": "-110"
-  }
-
-IMPORTANT:
-- Return a JSON ARRAY even if there's only one slip: [{ ... }]
-- ONE object per TICKET/SLIP, not per leg
-- date_placed is when the bet was placed (top of slip), match_date is when the game is
-- For parlays, the odds shown is the COMBINED parlay odds (e.g., +280)
-- potential_payout is the TOTAL you'd receive if you win
-- result should be "Pending" unless the slip shows it's already settled
-- Return ONLY the JSON array, no other text"""
-
+    # TEXT-ONLY call to Claude - no image, just parsing the OCR text
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2000,  # Increased for multiple slips
+        max_tokens=2000,
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": base64_image
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": extraction_prompt
-                    }
-                ]
+                "content": extraction_prompt  # Just text, no image
             }
         ]
     )
@@ -377,9 +369,8 @@ IMPORTANT:
     # Parse the response
     response_text = response.content[0].text
 
-    # Try to extract JSON from the response
     try:
-        # Handle cases where response might have markdown code blocks
+        # Handle markdown code blocks
         if "```json" in response_text:
             json_str = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
@@ -394,16 +385,11 @@ IMPORTANT:
             extracted_data = [extracted_data]
 
     except json.JSONDecodeError:
-        # If parsing fails, return a needs-review entry as a list
         extracted_data = [{
-            "date_placed": "",
-            "match_date": "",
-            "wager_amount": "",
-            "potential_payout": "",
             "result": "Pending",
             "confidence": "low",
-            "raw_text": response_text[:200],
-            "notes": "Failed to parse - manual review needed"
+            "raw_text": ocr_text[:300],
+            "notes": "Failed to parse OCR text - manual review needed"
         }]
 
     return extracted_data

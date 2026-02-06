@@ -480,70 +480,93 @@ def get_pending_bets():
 
 def get_nba_box_score(match_date: str, teams: str) -> str:
     """
-    Fetch NBA box score from balldontlie API (free, no key required).
-    Returns player stats including PTS, REB, AST, 3PM, etc.
+    Fetch NBA box score from balldontlie API.
+    Returns player stats including PTS, REB, AST, FG3M (3-pointers made), etc.
     """
+    api_key = os.getenv("BALLDONTLIE_API_KEY", "")
+    if not api_key:
+        logger.warning("BALLDONTLIE_API_KEY not set")
+        return ""
+
     try:
         # Parse date
         dt = datetime.strptime(match_date, "%Y-%m-%d")
         date_str = dt.strftime("%Y-%m-%d")
 
-        # Get games for that date
-        games_url = f"https://api.balldontlie.io/v1/games?dates[]={date_str}"
-        headers = {"Authorization": os.getenv("BALLDONTLIE_API_KEY", "")}  # Optional API key
+        # Headers with API key
+        headers = {"Authorization": api_key}
 
+        # Get games for this date
+        games_url = f"https://api.balldontlie.io/v1/games?dates[]={date_str}"
         response = requests.get(games_url, headers=headers, timeout=15)
+
         if response.status_code != 200:
             logger.warning(f"balldontlie games API returned {response.status_code}")
             return ""
 
         games = response.json().get('data', [])
+        if not games:
+            logger.info(f"No games found for {date_str}")
+            return ""
 
-        # Find the matching game
+        # Find matching game by team names
         teams_lower = teams.lower()
         game_id = None
         for game in games:
-            home = game.get('home_team', {}).get('name', '').lower()
-            away = game.get('visitor_team', {}).get('name', '').lower()
-            if home in teams_lower or away in teams_lower:
-                game_id = game.get('id')
-                home_score = game.get('home_team_score', 0)
-                away_score = game.get('visitor_team_score', 0)
-                logger.info(f"Found game: {away} @ {home} - {away_score}-{home_score}")
+            home = game.get('home_team', {}).get('full_name', '').lower()
+            away = game.get('visitor_team', {}).get('full_name', '').lower()
+            home_abbr = game.get('home_team', {}).get('abbreviation', '').lower()
+            away_abbr = game.get('visitor_team', {}).get('abbreviation', '').lower()
+
+            if (home in teams_lower or away in teams_lower or
+                home_abbr in teams_lower or away_abbr in teams_lower or
+                any(word in teams_lower for word in home.split()) or
+                any(word in teams_lower for word in away.split())):
+                game_id = game['id']
+                logger.info(f"Found matching game: {away} @ {home} (ID: {game_id})")
                 break
 
+        if not game_id and games:
+            # Just use first game if we can't match
+            game_id = games[0]['id']
+            logger.info(f"Using first game of day: {games[0].get('visitor_team', {}).get('full_name')} @ {games[0].get('home_team', {}).get('full_name')}")
+
         if not game_id:
-            logger.info(f"No matching game found for {teams} on {date_str}")
             return ""
 
         # Get box score stats for this game
-        stats_url = f"https://api.balldontlie.io/v1/stats?game_ids[]={game_id}&per_page=50"
+        stats_url = f"https://api.balldontlie.io/v1/stats?game_ids[]={game_id}&per_page=100"
         stats_response = requests.get(stats_url, headers=headers, timeout=15)
+
         if stats_response.status_code != 200:
+            logger.warning(f"balldontlie stats API returned {stats_response.status_code}")
             return ""
 
         stats = stats_response.json().get('data', [])
+
+        if not stats:
+            logger.info("No player stats found")
+            return ""
 
         # Build box score text
         box_score_lines = [f"NBA Box Score for {teams} on {date_str}:\n"]
         for stat in stats:
             player = stat.get('player', {})
-            first_name = player.get('first_name', '')
-            last_name = player.get('last_name', '')
-            pts = stat.get('pts', 0)
-            reb = stat.get('reb', 0)
-            ast = stat.get('ast', 0)
-            fg3m = stat.get('fg3m', 0)  # 3-pointers made
-            stl = stat.get('stl', 0)
-            blk = stat.get('blk', 0)
+            name = f"{player.get('first_name', '')} {player.get('last_name', '')}"
+            pts = stat.get('pts', 0) or 0
+            reb = stat.get('reb', 0) or 0
+            ast = stat.get('ast', 0) or 0
+            fg3m = stat.get('fg3m', 0) or 0  # 3-pointers MADE
+            stl = stat.get('stl', 0) or 0
+            blk = stat.get('blk', 0) or 0
 
-            if pts > 0 or reb > 0 or ast > 0:  # Only include players who played
+            if pts or reb or ast:  # Only include players who played
                 box_score_lines.append(
-                    f"{first_name} {last_name}: {pts} PTS, {reb} REB, {ast} AST, {fg3m} 3PM, {stl} STL, {blk} BLK"
+                    f"{name}: {pts} PTS, {reb} REB, {ast} AST, {fg3m} 3PM, {stl} STL, {blk} BLK"
                 )
 
         result = "\n".join(box_score_lines)
-        logger.info(f"Got box score with {len(stats)} players")
+        logger.info(f"Got balldontlie box score with {len(stats)} players")
         return result
 
     except Exception as e:

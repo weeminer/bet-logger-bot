@@ -478,8 +478,81 @@ def get_pending_bets():
     return pending_bets
 
 
+def get_nba_box_score(match_date: str, teams: str) -> str:
+    """
+    Fetch NBA box score from balldontlie API (free, no key required).
+    Returns player stats including PTS, REB, AST, 3PM, etc.
+    """
+    try:
+        # Parse date
+        dt = datetime.strptime(match_date, "%Y-%m-%d")
+        date_str = dt.strftime("%Y-%m-%d")
+
+        # Get games for that date
+        games_url = f"https://api.balldontlie.io/v1/games?dates[]={date_str}"
+        headers = {"Authorization": os.getenv("BALLDONTLIE_API_KEY", "")}  # Optional API key
+
+        response = requests.get(games_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            logger.warning(f"balldontlie games API returned {response.status_code}")
+            return ""
+
+        games = response.json().get('data', [])
+
+        # Find the matching game
+        teams_lower = teams.lower()
+        game_id = None
+        for game in games:
+            home = game.get('home_team', {}).get('name', '').lower()
+            away = game.get('visitor_team', {}).get('name', '').lower()
+            if home in teams_lower or away in teams_lower:
+                game_id = game.get('id')
+                home_score = game.get('home_team_score', 0)
+                away_score = game.get('visitor_team_score', 0)
+                logger.info(f"Found game: {away} @ {home} - {away_score}-{home_score}")
+                break
+
+        if not game_id:
+            logger.info(f"No matching game found for {teams} on {date_str}")
+            return ""
+
+        # Get box score stats for this game
+        stats_url = f"https://api.balldontlie.io/v1/stats?game_ids[]={game_id}&per_page=50"
+        stats_response = requests.get(stats_url, headers=headers, timeout=15)
+        if stats_response.status_code != 200:
+            return ""
+
+        stats = stats_response.json().get('data', [])
+
+        # Build box score text
+        box_score_lines = [f"NBA Box Score for {teams} on {date_str}:\n"]
+        for stat in stats:
+            player = stat.get('player', {})
+            first_name = player.get('first_name', '')
+            last_name = player.get('last_name', '')
+            pts = stat.get('pts', 0)
+            reb = stat.get('reb', 0)
+            ast = stat.get('ast', 0)
+            fg3m = stat.get('fg3m', 0)  # 3-pointers made
+            stl = stat.get('stl', 0)
+            blk = stat.get('blk', 0)
+
+            if pts > 0 or reb > 0 or ast > 0:  # Only include players who played
+                box_score_lines.append(
+                    f"{first_name} {last_name}: {pts} PTS, {reb} REB, {ast} AST, {fg3m} 3PM, {stl} STL, {blk} BLK"
+                )
+
+        result = "\n".join(box_score_lines)
+        logger.info(f"Got box score with {len(stats)} players")
+        return result
+
+    except Exception as e:
+        logger.error(f"balldontlie API error: {e}")
+        return ""
+
+
 def search_game_result(bet: dict) -> str:
-    """Search for game result using Tavily API."""
+    """Search for game result using Tavily API (or balldontlie for NBA player props)."""
     match_date = bet['match_date']
     league = bet['league']
     teams = bet['teams_event']
@@ -509,23 +582,40 @@ def search_game_result(bet: dict) -> str:
     is_partial = any(x in selection.lower() for x in ['1q', '2q', '3q', '4q', '1h', '2h', 'first quarter', 'first half', 'second half'])
 
     # Check if it's a player prop
-    player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks', 'alt']
+    player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks', 'alt', 'pts', 'reb', 'ast']
     has_player_stat = any(kw in selection.lower() for kw in player_keywords)
+
+    # For NBA player props, use balldontlie API for reliable stats
+    if league.upper() == 'NBA' and (has_player_stat or 'sgp' in bet_type or 'parlay' in bet_type):
+        logger.info(f"NBA player prop detected - using balldontlie API")
+        box_score = get_nba_box_score(match_date, teams)
+        if box_score:
+            # Also get the final score via Tavily for context
+            score_query = f"{simple_teams} {short_date} final score"
+            try:
+                score_response = requests.post(
+                    "https://api.tavily.com/search",
+                    json={"api_key": TAVILY_API_KEY, "query": score_query, "max_results": 2, "include_answer": True},
+                    timeout=15
+                )
+                score_data = score_response.json()
+                score_summary = score_data.get('answer', '')
+            except:
+                score_summary = ""
+
+            return f"{score_summary}\n\n{box_score}"
+        else:
+            logger.info("balldontlie returned no data, falling back to Tavily")
 
     # Check for specific stat types to customize search
     needs_3pm = any(kw in selection.lower() for kw in ['3-point', 'threes', 'three', '3pm', 'made threes'])
 
-    # For player props and SGPs, search for box score specifically
+    # For non-NBA player props or fallback, use Tavily
     include_domains = None
     if has_player_stat or 'sgp' in bet_type or 'parlay' in bet_type:
-        # Search ESPN specifically for box scores with player stats
-        if needs_3pm:
-            query = f"{simple_teams} {short_date} box score 3-pointers"
-            logger.info(f"3PM prop detected - searching for 3-point stats")
-        else:
-            query = f"{simple_teams} {short_date} box score"
-            logger.info(f"Player prop detected - searching box scores")
+        query = f"{simple_teams} {short_date} box score"
         include_domains = ["espn.com", "nba.com", "basketball-reference.com"]
+        logger.info(f"Using Tavily for player prop search")
     elif is_partial:
         query = f"{simple_teams} {short_date} box score quarter by quarter"
         include_domains = ["espn.com", "nba.com"]
@@ -644,12 +734,15 @@ The search results may contain box score data from ESPN/NBA.com. Look for:
 - Assists: "AST" column or "X assists" in text
 - 3-Pointers Made: "3PM", "3PT", "3P", "FG3M" column, or "X three-pointers", "X 3-pointers", "X threes"
 
-Examples of how 3PM stats appear:
+Examples of how 3PM stats appear in box scores:
+- ESPN format: "3PT: 5-9" means 5 makes out of 9 attempts → 5 3PM
+- "3PT 4-8" or "3P: 4-8" → 4 3PM (first number is makes)
 - "Brandon Ingram: 33 PTS, 4 3PM"
-- "Ingram ... 33 ... 4 ... (points, 3-pointers)"
-- "went 4-of-8 from three"
-- "made 4 three-pointers"
-- "4 3PT"
+- "went 4-of-8 from three" → 4 3PM
+- "made 4 three-pointers" → 4 3PM
+
+IMPORTANT: In "X-Y" format (like "5-9"), X = makes, Y = attempts
+So "3PT: 5-9" means 5 three-pointers MADE
 
 For "3+ Made Threes" bets:
 - 3 or more 3PM = WIN

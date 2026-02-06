@@ -6,3 +6,4 @@ anthropic
 requests
 Pillow
 pillow-heif
+nba_api

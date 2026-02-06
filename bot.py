@@ -367,12 +367,11 @@ Each Ticket Cost pairs with a Max payout. Match by value logic:
 - $1200.00 cost → $6681.00 max payout (ratio ~5.6x)
 - $1200.00 cost → $9205.00 max payout (ratio ~7.7x)
 
-STEP 4 - MATCH SELECTIONS (use player/team logic):
-- Look at which PLAYERS appear with which TEAMS/GAMES
-- Wendell Carter Jr. plays for ORLANDO → his props go with Orlando games
-- Desmond Bane plays for MEMPHIS → his props go with Memphis games
-- Jake Laravia plays for MEMPHIS → his props go with Memphis games
-- Match player props to the correct game based on the team they play for
+STEP 4 - MATCH SELECTIONS:
+- Look for player names that appear NEAR game names in the OCR text
+- Look for player names that appear NEAR Slip IDs or Ticket Costs
+- DO NOT try to guess which team a player plays for - teams change frequently
+- Just report what the OCR text shows
 
 STEP 5 - IF UNCERTAIN:
 If you cannot reliably determine which selection goes with which slip:
@@ -405,8 +404,8 @@ CRITICAL RULES:
 - "Max payout" = potential_payout (it already includes the wager)
 - SGP = Same Game Parlay (multiple legs on same game)
 - Each Ticket Cost is ONE separate bet
-- Use player's actual NBA team to match props to games
-- If you can't match a selection confidently, put "UNKNOWN - see raw_text" and list options
+- Extract player names and props exactly as they appear in the OCR
+- If you can't match a selection to a slip, put it in notes field
 - NEVER randomly assign selections - wrong data is worse than uncertain data
 - Return JSON array only"""
 
@@ -513,13 +512,20 @@ def search_game_result(bet: dict) -> str:
     player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks', 'alt']
     has_player_stat = any(kw in selection.lower() for kw in player_keywords)
 
+    # Check for specific stat types to customize search
+    needs_3pm = any(kw in selection.lower() for kw in ['3-point', 'threes', 'three', '3pm', 'made threes'])
+
     # For player props and SGPs, search for box score specifically
     include_domains = None
     if has_player_stat or 'sgp' in bet_type or 'parlay' in bet_type:
         # Search ESPN specifically for box scores with player stats
-        query = f"{simple_teams} {short_date} box score"
+        if needs_3pm:
+            query = f"{simple_teams} {short_date} box score 3-pointers"
+            logger.info(f"3PM prop detected - searching for 3-point stats")
+        else:
+            query = f"{simple_teams} {short_date} box score"
+            logger.info(f"Player prop detected - searching box scores")
         include_domains = ["espn.com", "nba.com", "basketball-reference.com"]
-        logger.info(f"Player prop detected - searching box scores on sports sites")
     elif is_partial:
         query = f"{simple_teams} {short_date} box score quarter by quarter"
         include_domains = ["espn.com", "nba.com"]
@@ -636,12 +642,18 @@ The search results may contain box score data from ESPN/NBA.com. Look for:
 - Points: "PTS" column or "X points" in text
 - Rebounds: "REB" column or "X rebounds" in text
 - Assists: "AST" column or "X assists" in text
-- 3-Pointers: "3PM" or "3PT" column or "X three-pointers" in text
+- 3-Pointers Made: "3PM", "3PT", "3P", "FG3M" column, or "X three-pointers", "X 3-pointers", "X threes"
 
-Examples of how stats appear:
-- "Wendell Carter Jr. 12 PTS, 9 REB, 2 AST"
-- "W. Carter: 12 points, 9 rebounds"
-- Box score row: "Carter Jr. ... 12 ... 9 ... 2"
+Examples of how 3PM stats appear:
+- "Brandon Ingram: 33 PTS, 4 3PM"
+- "Ingram ... 33 ... 4 ... (points, 3-pointers)"
+- "went 4-of-8 from three"
+- "made 4 three-pointers"
+- "4 3PT"
+
+For "3+ Made Threes" bets:
+- 3 or more 3PM = WIN
+- 2 or fewer 3PM = LOSS
 
 For OVER bets: Player stat > line = WIN, stat < line = LOSS, equal = PUSH
 For UNDER bets: Player stat < line = WIN, stat > line = LOSS, equal = PUSH

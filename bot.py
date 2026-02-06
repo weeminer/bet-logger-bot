@@ -480,102 +480,153 @@ def get_pending_bets():
 
 def get_nba_box_score(match_date: str, teams: str) -> str:
     """
-    Fetch NBA box score using nba_api package (free, no API key required).
-    Returns player stats including PTS, REB, AST, FG3M (3-pointers made), etc.
+    Fetch NBA box score using ESPN's public API (no auth required, not blocked).
+    Returns player stats including PTS, REB, AST, 3PM, etc.
     """
-    try:
-        from nba_api.stats.endpoints import scoreboardv2, boxscoretraditionalv3
-        from nba_api.stats.static import teams as nba_teams
-    except ImportError:
-        logger.warning("nba_api package not installed")
-        return ""
-
     try:
         # Parse date
         dt = datetime.strptime(match_date, "%Y-%m-%d")
-        date_str = dt.strftime("%m/%d/%Y")  # NBA API uses MM/DD/YYYY format
+        date_str = dt.strftime("%Y%m%d")  # ESPN uses YYYYMMDD format
 
         # Get scoreboard for the date
-        scoreboard = scoreboardv2.ScoreboardV2(game_date=date_str)
-        games_df = scoreboard.get_data_frames()[0]  # GameHeader
+        scoreboard_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}"
+        response = requests.get(scoreboard_url, timeout=10)
 
-        if games_df.empty:
-            logger.info(f"No NBA games found for {match_date}")
+        if response.status_code != 200:
+            logger.warning(f"ESPN scoreboard API returned {response.status_code}")
+            return ""
+
+        data = response.json()
+        events = data.get('events', [])
+
+        if not events:
+            logger.info(f"No NBA games found on ESPN for {match_date}")
             return ""
 
         # Find matching game by team names
         teams_lower = teams.lower()
         game_id = None
+        matched_teams = ""
 
-        for _, game in games_df.iterrows():
-            home_id = game.get('HOME_TEAM_ID')
-            away_id = game.get('VISITOR_TEAM_ID')
+        for event in events:
+            competitors = event.get('competitions', [{}])[0].get('competitors', [])
+            if len(competitors) >= 2:
+                team1 = competitors[0].get('team', {})
+                team2 = competitors[1].get('team', {})
 
-            # Get team info
-            all_teams = nba_teams.get_teams()
-            home_team = next((t for t in all_teams if t['id'] == home_id), {})
-            away_team = next((t for t in all_teams if t['id'] == away_id), {})
+                team1_name = team1.get('displayName', '').lower()
+                team2_name = team2.get('displayName', '').lower()
+                team1_abbr = team1.get('abbreviation', '').lower()
+                team2_abbr = team2.get('abbreviation', '').lower()
+                team1_short = team1.get('shortDisplayName', '').lower()
+                team2_short = team2.get('shortDisplayName', '').lower()
 
-            home_name = home_team.get('full_name', '').lower()
-            away_name = away_team.get('full_name', '').lower()
-            home_abbr = home_team.get('abbreviation', '').lower()
-            away_abbr = away_team.get('abbreviation', '').lower()
-            home_nickname = home_team.get('nickname', '').lower()
-            away_nickname = away_team.get('nickname', '').lower()
+                if (team1_name in teams_lower or team2_name in teams_lower or
+                    team1_abbr in teams_lower or team2_abbr in teams_lower or
+                    team1_short in teams_lower or team2_short in teams_lower or
+                    any(word in teams_lower for word in team1_name.split()) or
+                    any(word in teams_lower for word in team2_name.split())):
+                    game_id = event.get('id')
+                    matched_teams = f"{team1.get('displayName')} vs {team2.get('displayName')}"
+                    logger.info(f"Found matching ESPN game: {matched_teams} (ID: {game_id})")
+                    break
 
-            if (home_name in teams_lower or away_name in teams_lower or
-                home_abbr in teams_lower or away_abbr in teams_lower or
-                home_nickname in teams_lower or away_nickname in teams_lower or
-                any(word in teams_lower for word in home_name.split()) or
-                any(word in teams_lower for word in away_name.split())):
-                game_id = game['GAME_ID']
-                logger.info(f"Found matching NBA game: {away_name} @ {home_name} (ID: {game_id})")
-                break
-
-        if not game_id and not games_df.empty:
-            # Just use first game if we can't match
-            game_id = games_df.iloc[0]['GAME_ID']
-            logger.info(f"Using first NBA game of day (ID: {game_id})")
+        if not game_id and events:
+            # Use first game if no match
+            game_id = events[0].get('id')
+            logger.info(f"Using first ESPN game of day (ID: {game_id})")
 
         if not game_id:
             return ""
 
-        # Get box score for this game (V3 for 2025-26 season)
-        boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3(game_id=game_id)
-        boxscore_data = boxscore.get_dict()
+        # Get box score for this game
+        boxscore_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={game_id}"
+        box_response = requests.get(boxscore_url, timeout=10)
 
-        # V3 returns data in 'boxScoreTraditional' -> 'playerStats' format
-        player_stats = boxscore_data.get('boxScoreTraditional', {}).get('playerStats', [])
-
-        if not player_stats:
-            logger.info("No player stats found in V3 box score")
+        if box_response.status_code != 200:
+            logger.warning(f"ESPN boxscore API returned {box_response.status_code}")
             return ""
 
-        logger.info(f"V3 box score returned {len(player_stats)} players")
+        box_data = box_response.json()
+
+        # Extract player stats from boxscore
+        boxscore = box_data.get('boxscore', {})
+        players_data = boxscore.get('players', [])
+
+        if not players_data:
+            logger.info("No player stats found in ESPN box score")
+            return ""
 
         # Build box score text
         box_score_lines = [f"NBA Box Score for {teams} on {match_date}:\n"]
-        for player in player_stats:
-            # V3 uses camelCase keys
-            name = player.get('name', '') or f"{player.get('firstName', '')} {player.get('familyName', '')}"
-            pts = player.get('points', 0) or 0
-            reb = player.get('reboundsTotal', 0) or 0
-            ast = player.get('assists', 0) or 0
-            fg3m = player.get('threePointersMade', 0) or 0  # 3-pointers MADE
-            stl = player.get('steals', 0) or 0
-            blk = player.get('blocks', 0) or 0
+        player_count = 0
 
-            if pts or reb or ast:  # Only include players who played
-                box_score_lines.append(
-                    f"{name}: {pts} PTS, {reb} REB, {ast} AST, {fg3m} 3PM, {stl} STL, {blk} BLK"
-                )
+        for team_data in players_data:
+            team_name = team_data.get('team', {}).get('displayName', 'Unknown')
+            statistics = team_data.get('statistics', [])
+
+            if not statistics:
+                continue
+
+            # Find the main stats category (usually first one)
+            stat_category = statistics[0] if statistics else {}
+            stat_names = stat_category.get('names', [])
+            athletes = stat_category.get('athletes', [])
+
+            # Find indices for stats we need
+            try:
+                pts_idx = stat_names.index('PTS') if 'PTS' in stat_names else -1
+                reb_idx = stat_names.index('REB') if 'REB' in stat_names else -1
+                ast_idx = stat_names.index('AST') if 'AST' in stat_names else -1
+                stl_idx = stat_names.index('STL') if 'STL' in stat_names else -1
+                blk_idx = stat_names.index('BLK') if 'BLK' in stat_names else -1
+                # 3PM is usually labeled as '3PT' or '3PM' in ESPN
+                fg3m_idx = -1
+                for i, name in enumerate(stat_names):
+                    if '3P' in name.upper() and 'A' not in name.upper():  # 3PT or 3PM, not 3PA
+                        fg3m_idx = i
+                        break
+                    if name.upper() == '3PM':
+                        fg3m_idx = i
+                        break
+            except ValueError:
+                continue
+
+            for athlete in athletes:
+                player_name = athlete.get('athlete', {}).get('displayName', '')
+                stats = athlete.get('stats', [])
+
+                if not stats or stats[0] == '--':  # DNP
+                    continue
+
+                # Parse stats - ESPN uses string format like "5-10" for FG, single numbers for PTS
+                pts = int(stats[pts_idx]) if pts_idx >= 0 and pts_idx < len(stats) and stats[pts_idx].isdigit() else 0
+                reb = int(stats[reb_idx]) if reb_idx >= 0 and reb_idx < len(stats) and stats[reb_idx].isdigit() else 0
+                ast = int(stats[ast_idx]) if ast_idx >= 0 and ast_idx < len(stats) and stats[ast_idx].isdigit() else 0
+                stl = int(stats[stl_idx]) if stl_idx >= 0 and stl_idx < len(stats) and stats[stl_idx].isdigit() else 0
+                blk = int(stats[blk_idx]) if blk_idx >= 0 and blk_idx < len(stats) and stats[blk_idx].isdigit() else 0
+
+                # 3PM - could be "2-5" format or just "2"
+                fg3m = 0
+                if fg3m_idx >= 0 and fg3m_idx < len(stats):
+                    fg3_val = stats[fg3m_idx]
+                    if '-' in str(fg3_val):
+                        fg3m = int(fg3_val.split('-')[0])  # "2-5" -> 2 made
+                    elif str(fg3_val).isdigit():
+                        fg3m = int(fg3_val)
+
+                if pts or reb or ast:  # Only include players who played
+                    box_score_lines.append(
+                        f"{player_name}: {pts} PTS, {reb} REB, {ast} AST, {fg3m} 3PM, {stl} STL, {blk} BLK"
+                    )
+                    player_count += 1
 
         result = "\n".join(box_score_lines)
-        logger.info(f"Got nba_api V3 box score with {len(player_stats)} players")
+        logger.info(f"Got ESPN box score with {player_count} players")
         return result
 
     except Exception as e:
-        logger.error(f"nba_api error: {e}")
+        logger.error(f"ESPN API error: {e}")
         return ""
 
 

@@ -330,7 +330,12 @@ def extract_bet_data_from_image(image_bytes: bytes) -> list:
             "result": "Pending"
         }]
 
-    logger.info(f"OCR Text extracted ({len(ocr_text)} chars):\n{ocr_text[:500]}...")
+    # Log the FULL OCR text for debugging (helps identify structure issues)
+    logger.info(f"="*60)
+    logger.info(f"RAW OCR TEXT ({len(ocr_text)} chars):")
+    logger.info(f"="*60)
+    logger.info(ocr_text)
+    logger.info(f"="*60)
 
     # Step 3: Use Claude to parse the extracted text (TEXT ONLY - no image)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -342,24 +347,35 @@ OCR TEXT:
 {ocr_text}
 \"\"\"
 
+CRITICAL PARSING RULES FOR MULTIPLE SLIPS:
+
 STEP 1 - FIND ALL BETSLIP NUMBERS:
-Look for long numbers (11-20 digits) like: 12188711295, 12188710078, 12188756049, etc.
-These are unique identifiers for each bet slip. COUNT how many you find.
+Look for long numbers (11-20 digits) like: 12188711295, 12188710078, etc.
+List them in the ORDER they appear in the text.
 
-STEP 2 - FOR EACH BETSLIP NUMBER, EXTRACT ITS DATA:
-The OCR text may be jumbled, but each betslip has its own:
-- Wager amount (e.g., "$500.00", "$1,000.00")
-- Potential payout (e.g., "$2,100.00", "$935.00")
-- Odds (e.g., "+320", "-115", "-110")
-- Selection - INCLUDE QUARTER/HALF INFO! Examples:
-  * "CHI Bulls +17.5 1H" (1st Half spread)
-  * "CHI Bulls +2.5 2Q" (2nd Quarter spread)
-  * "Over 58.5 1Q" (1st Quarter total)
-  * "DEN Nuggets ML" (full game moneyline)
-  * "Under 209.5" (full game total)
-- Teams (e.g., "DEN Nuggets @ DET Pistons")
+STEP 2 - SEGMENT THE TEXT BY BETSLIP:
+The text for each betslip appears NEAR its betslip number in the OCR text.
+- Look at what text appears AFTER each betslip number and BEFORE the next betslip number
+- Each segment belongs to that betslip
+- Do NOT mix data between segments
 
-STEP 3 - OUTPUT ONE OBJECT PER BETSLIP:
+STEP 3 - FOR EACH SEGMENT, EXTRACT:
+Each betslip has ONE of each:
+- ONE wager amount (e.g., "$500.00")
+- ONE potential payout (e.g., "$935.00")
+- ONE odds value (e.g., "-115")
+- ONE selection with quarter/half if applicable
+
+MATCHING RULE: Match wager/payout/odds that appear in the SAME segment as the betslip number.
+
+Example: If OCR shows:
+"12188711295 ... Bulls +17.5 1H ... -115 ... $500.00 ... $935.00 ... 12188710078 ... Thunder ML ... +150 ... $200.00 ... $500.00"
+
+Then:
+- Slip 12188711295 gets: Bulls +17.5 1H, -115, $500.00 wager, $935.00 payout
+- Slip 12188710078 gets: Thunder ML, +150, $200.00 wager, $500.00 payout
+
+STEP 4 - OUTPUT ONE OBJECT PER BETSLIP:
 You MUST output exactly as many objects as there are betslip numbers.
 If you found 4 betslip numbers, output 4 objects.
 

@@ -347,61 +347,67 @@ OCR TEXT:
 {ocr_text}
 \"\"\"
 
-CRITICAL PARSING RULES FOR MULTIPLE SLIPS:
+WARNING: The OCR text is JUMBLED. Data from different slips is mixed together.
 
-STEP 1 - FIND ALL BETSLIP NUMBERS:
-Look for long numbers (11-20 digits) like: 12188711295, 12188710078, etc.
-List them in the ORDER they appear in the text.
+STEP 1 - INVENTORY EVERYTHING (list what you find):
+a) All "Slip ID: XXXX" numbers
+b) All "Ticket Cost $XXX.XX" amounts
+c) All "Max payout: $XXX.XX" amounts
+d) All player props (e.g., "Jake Laravia Over 7.5", "Wendell Carter Jr. Over 8.5")
+e) All game names (e.g., "Brooklyn Nets At Orlando Magic")
+f) All odds values (+457, +667, etc.)
 
-STEP 2 - SEGMENT THE TEXT BY BETSLIP:
-The text for each betslip appears NEAR its betslip number in the OCR text.
-- Look at what text appears AFTER each betslip number and BEFORE the next betslip number
-- Each segment belongs to that betslip
-- Do NOT mix data between segments
+STEP 2 - COUNT THE BETS:
+Number of bets = number of unique "Ticket Cost" entries
 
-STEP 3 - FOR EACH SEGMENT, EXTRACT:
-Each betslip has ONE of each:
-- ONE wager amount (e.g., "$500.00")
-- ONE potential payout (e.g., "$935.00")
-- ONE odds value (e.g., "-115")
-- ONE selection with quarter/half if applicable
+STEP 3 - MATCH AMOUNTS (most reliable):
+Each Ticket Cost pairs with a Max payout. Match by value logic:
+- $446.75 cost → $5220.00 max payout (ratio ~11.7x)
+- $603.75 cost → $3188.00 max payout (ratio ~5.3x)
+- $1200.00 cost → $6681.00 max payout (ratio ~5.6x)
+- $1200.00 cost → $9205.00 max payout (ratio ~7.7x)
 
-MATCHING RULE: Match wager/payout/odds that appear in the SAME segment as the betslip number.
+STEP 4 - MATCH SELECTIONS (use player/team logic):
+- Look at which PLAYERS appear with which TEAMS/GAMES
+- Wendell Carter Jr. plays for ORLANDO → his props go with Orlando games
+- Desmond Bane plays for MEMPHIS → his props go with Memphis games
+- Jake Laravia plays for MEMPHIS → his props go with Memphis games
+- Match player props to the correct game based on the team they play for
 
-Example: If OCR shows:
-"12188711295 ... Bulls +17.5 1H ... -115 ... $500.00 ... $935.00 ... 12188710078 ... Thunder ML ... +150 ... $200.00 ... $500.00"
+STEP 5 - IF UNCERTAIN:
+If you cannot reliably determine which selection goes with which slip:
+- Put "REVIEW NEEDED" in the notes
+- List ALL found selections in the raw_text field
+- Do NOT guess randomly
 
-Then:
-- Slip 12188711295 gets: Bulls +17.5 1H, -115, $500.00 wager, $935.00 payout
-- Slip 12188710078 gets: Thunder ML, +150, $200.00 wager, $500.00 payout
-
-STEP 4 - OUTPUT ONE OBJECT PER BETSLIP:
-You MUST output exactly as many objects as there are betslip numbers.
-If you found 4 betslip numbers, output 4 objects.
+STEP 6 - OUTPUT ONE OBJECT PER BET:
 
 FORMAT for each:
 {{
-    "betslip_number": "exact number like 12188711295",
-    "date_placed": "YYYY-MM-DD",
+    "betslip_number": "the long number (11-20 digits) OR Slip ID if no long number",
+    "date_placed": "YYYY-MM-DD (from dates like 05Feb26 = 2026-02-05)",
     "match_date": "YYYY-MM-DD",
     "league": "NBA/NCAAB/NFL/NCAAF/MLB/NHL",
     "teams_event": "Team A @ Team B",
-    "selection": "the pick WITH period if not full game (e.g., 'Bulls +17.5 1H', 'Over 58.5 1Q', 'Thunder +2.5 2Q')",
+    "selection": "For SGP/Parlay: list ALL legs like 'Jake Laravia Over 7.5 + Nolan Traore Under 3.5'",
     "bet_type": "Spread/Moneyline/Total/Parlay/SGP",
-    "odds": "+320 or -115 etc",
-    "wager_amount": "number only like 500",
-    "potential_payout": "number only like 2100",
+    "odds": "+457 or -115 etc (look for + or - followed by numbers)",
+    "wager_amount": "from 'Ticket Cost $XXX' - number only like 446.75",
+    "potential_payout": "from 'Max payout $XXX' - number only like 5220",
     "result": "Pending",
     "confidence": "high/medium/low",
-    "raw_text": "key text for THIS slip",
+    "raw_text": "Slip ID and key details for THIS bet only",
     "notes": "issues if any"
 }}
 
-IMPORTANT:
-- College teams = NCAAB/NCAAF
-- Pro teams (Nuggets, Celtics, etc.) = NBA/NFL
-- DO NOT skip any betslip numbers
-- DO NOT merge data from different slips
+CRITICAL RULES:
+- "Ticket Cost" = wager_amount
+- "Max payout" = potential_payout (it already includes the wager)
+- SGP = Same Game Parlay (multiple legs on same game)
+- Each Ticket Cost is ONE separate bet
+- Use player's actual NBA team to match props to games
+- If you can't match a selection confidently, put "UNKNOWN - see raw_text" and list options
+- NEVER randomly assign selections - wrong data is worse than uncertain data
 - Return JSON array only"""
 
     # TEXT-ONLY call to Claude - no image, just parsing the OCR text
@@ -481,45 +487,65 @@ def search_game_result(bet: dict) -> str:
     selection = bet['selection']
     bet_type = bet.get('bet_type', '').lower()
 
-    # Parse date to more natural format (Feb 3 2026)
+    # Parse date to more natural format (Feb 5 2026)
     try:
-        from datetime import datetime
         dt = datetime.strptime(match_date, "%Y-%m-%d")
-        date_str = dt.strftime("%B %d %Y")  # "February 03 2026"
+        date_str = dt.strftime("%B %d %Y")  # "February 05 2026"
+        short_date = dt.strftime("%b %d %Y")  # "Feb 05 2026"
     except:
         date_str = match_date
+        short_date = match_date
 
-    # Clean up team names (remove @ symbol, abbreviations)
-    teams_clean = teams.replace("@", "vs").replace("  ", " ")
+    # Clean up team names - extract just team names
+    teams_clean = teams.replace("@", "vs").replace("  ", " ").strip()
+
+    # Try to get simpler team names (e.g., "Nets Magic" from "Brooklyn Nets @ Orlando Magic")
+    team_words = []
+    for word in teams_clean.replace("vs", " ").split():
+        if word not in ['at', 'At', 'AT', '@']:
+            team_words.append(word)
+    simple_teams = " ".join(team_words[-4:]) if len(team_words) > 4 else " ".join(team_words)
 
     # Check bet type to customize search
     is_partial = any(x in selection.lower() for x in ['1q', '2q', '3q', '4q', '1h', '2h', 'first quarter', 'first half', 'second half'])
-    is_player_prop = 'parlay' in bet_type or 'over' in selection.lower() or 'under' in selection.lower()
 
-    # Check if it's a player prop (has a player name pattern)
-    player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks']
+    # Check if it's a player prop
+    player_keywords = ['points', 'assists', 'rebounds', '3-point', 'threes', 'steals', 'blocks', 'alt']
     has_player_stat = any(kw in selection.lower() for kw in player_keywords)
 
-    if has_player_stat:
-        # Extract potential player name from selection (first 2-3 words often)
-        query = f"{selection.split('Over')[0].split('Under')[0].strip()} stats {date_str} {league}"
+    # For player props and SGPs, search for box score specifically
+    include_domains = None
+    if has_player_stat or 'sgp' in bet_type or 'parlay' in bet_type:
+        # Search ESPN specifically for box scores with player stats
+        query = f"{simple_teams} {short_date} box score"
+        include_domains = ["espn.com", "nba.com", "basketball-reference.com"]
+        logger.info(f"Player prop detected - searching box scores on sports sites")
     elif is_partial:
-        query = f"{teams_clean} {date_str} box score quarter scores"
+        query = f"{simple_teams} {short_date} box score quarter by quarter"
+        include_domains = ["espn.com", "nba.com"]
     else:
-        query = f"{teams_clean} {date_str} final score"
+        query = f"{simple_teams} {date_str} final score"
 
     logger.info(f"Searching Tavily for: {query}")
 
     try:
+        # Build request payload
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "advanced",
+            "include_answer": True,
+            "max_results": 5
+        }
+
+        # Add domain filtering for player props (ESPN, NBA.com, etc.)
+        if include_domains:
+            payload["include_domains"] = include_domains
+            logger.info(f"Filtering to domains: {include_domains}")
+
         response = requests.post(
             "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "include_answer": True,
-                "max_results": 5
-            },
+            json=payload,
             timeout=30
         )
         response.raise_for_status()
@@ -530,9 +556,10 @@ def search_game_result(bet: dict) -> str:
         if data.get('answer'):
             result_text += f"Summary: {data['answer']}\n\n"
 
-        for r in data.get('results', [])[:3]:
-            result_text += f"Source: {r.get('title', '')}\n{r.get('content', '')}\n\n"
+        for r in data.get('results', [])[:5]:  # Get more results for box scores
+            result_text += f"Source: {r.get('title', '')}\nURL: {r.get('url', '')}\n{r.get('content', '')}\n\n"
 
+        logger.info(f"Search returned {len(data.get('results', []))} results")
         return result_text if result_text else "No results found"
 
     except Exception as e:
@@ -600,11 +627,24 @@ MONEYLINE (ML): Just check which team won the game
 
 1Q/1H BETS: Use ONLY the 1st quarter or 1st half scores, not the final score
 
-PARLAYS: ALL legs must win. If ANY leg loses, the parlay loses.
+PARLAYS/SGP: ALL legs must win. If ANY leg loses, the parlay loses.
+- Grade each leg separately, then combine
 - If you can't verify ALL legs, return "Pending"
 
-PLAYER PROPS: Look for individual player stats in the search results.
-- If player stats not found, return "Pending"
+PLAYER PROPS - HOW TO FIND STATS IN BOX SCORES:
+The search results may contain box score data from ESPN/NBA.com. Look for:
+- Points: "PTS" column or "X points" in text
+- Rebounds: "REB" column or "X rebounds" in text
+- Assists: "AST" column or "X assists" in text
+- 3-Pointers: "3PM" or "3PT" column or "X three-pointers" in text
+
+Examples of how stats appear:
+- "Wendell Carter Jr. 12 PTS, 9 REB, 2 AST"
+- "W. Carter: 12 points, 9 rebounds"
+- Box score row: "Carter Jr. ... 12 ... 9 ... 2"
+
+For OVER bets: Player stat > line = WIN, stat < line = LOSS, equal = PUSH
+For UNDER bets: Player stat < line = WIN, stat > line = LOSS, equal = PUSH
 
 1Q/1H BETS: Need quarter-by-quarter or half scores.
 - If quarter/half scores not found, return "Pending"

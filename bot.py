@@ -484,7 +484,7 @@ def get_nba_box_score(match_date: str, teams: str) -> str:
     Returns player stats including PTS, REB, AST, FG3M (3-pointers made), etc.
     """
     try:
-        from nba_api.stats.endpoints import scoreboardv2, boxscoretraditionalv2
+        from nba_api.stats.endpoints import scoreboardv2, boxscoretraditionalv3
         from nba_api.stats.static import teams as nba_teams
     except ImportError:
         logger.warning("nba_api package not installed")
@@ -540,24 +540,30 @@ def get_nba_box_score(match_date: str, teams: str) -> str:
         if not game_id:
             return ""
 
-        # Get box score for this game
-        boxscore = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id)
-        player_stats_df = boxscore.get_data_frames()[0]  # PlayerStats
+        # Get box score for this game (V3 for 2025-26 season)
+        boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3(game_id=game_id)
+        boxscore_data = boxscore.get_dict()
 
-        if player_stats_df.empty:
-            logger.info("No player stats found in box score")
+        # V3 returns data in 'boxScoreTraditional' -> 'playerStats' format
+        player_stats = boxscore_data.get('boxScoreTraditional', {}).get('playerStats', [])
+
+        if not player_stats:
+            logger.info("No player stats found in V3 box score")
             return ""
+
+        logger.info(f"V3 box score returned {len(player_stats)} players")
 
         # Build box score text
         box_score_lines = [f"NBA Box Score for {teams} on {match_date}:\n"]
-        for _, player in player_stats_df.iterrows():
-            name = player.get('PLAYER_NAME', '')
-            pts = player.get('PTS', 0) or 0
-            reb = player.get('REB', 0) or 0
-            ast = player.get('AST', 0) or 0
-            fg3m = player.get('FG3M', 0) or 0  # 3-pointers MADE
-            stl = player.get('STL', 0) or 0
-            blk = player.get('BLK', 0) or 0
+        for player in player_stats:
+            # V3 uses camelCase keys
+            name = player.get('name', '') or f"{player.get('firstName', '')} {player.get('familyName', '')}"
+            pts = player.get('points', 0) or 0
+            reb = player.get('reboundsTotal', 0) or 0
+            ast = player.get('assists', 0) or 0
+            fg3m = player.get('threePointersMade', 0) or 0  # 3-pointers MADE
+            stl = player.get('steals', 0) or 0
+            blk = player.get('blocks', 0) or 0
 
             if pts or reb or ast:  # Only include players who played
                 box_score_lines.append(
@@ -565,7 +571,7 @@ def get_nba_box_score(match_date: str, teams: str) -> str:
                 )
 
         result = "\n".join(box_score_lines)
-        logger.info(f"Got nba_api box score with {len(player_stats_df)} players")
+        logger.info(f"Got nba_api V3 box score with {len(player_stats)} players")
         return result
 
     except Exception as e:

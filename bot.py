@@ -1321,12 +1321,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'pending_photos' not in context.user_data:
         context.user_data['pending_photos'] = []
 
+    # Clear stale photos if they've been sitting for more than 5 minutes
+    import time
+    last_photo_time = context.user_data.get('last_photo_time', 0)
+    if context.user_data['pending_photos'] and (time.time() - last_photo_time > 300):
+        logger.info(f"Clearing {len(context.user_data['pending_photos'])} stale pending photos")
+        context.user_data['pending_photos'] = []
+
     # Check if this is the first photo (need to ask for trader)
     is_first_photo = len(context.user_data['pending_photos']) == 0
 
     # Add this photo to the pending list
     context.user_data['pending_photos'].append(photo_bytes.getvalue())
     context.user_data['bettor_name'] = bettor_name
+    context.user_data['last_photo_time'] = time.time()
 
     if is_first_photo:
         # First photo - ask for trader
@@ -1373,12 +1381,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'pending_photos' not in context.user_data:
         context.user_data['pending_photos'] = []
 
+    # Clear stale photos if they've been sitting for more than 5 minutes
+    import time
+    last_photo_time = context.user_data.get('last_photo_time', 0)
+    if context.user_data['pending_photos'] and (time.time() - last_photo_time > 300):
+        logger.info(f"Clearing {len(context.user_data['pending_photos'])} stale pending photos (document)")
+        context.user_data['pending_photos'] = []
+
     # Check if this is the first photo (need to ask for trader)
     is_first_photo = len(context.user_data['pending_photos']) == 0
 
     # Add this photo to the pending list
     context.user_data['pending_photos'].append(file_bytes.getvalue())
     context.user_data['bettor_name'] = bettor_name
+    context.user_data['last_photo_time'] = time.time()
 
     if is_first_photo:
         # First photo - ask for trader
